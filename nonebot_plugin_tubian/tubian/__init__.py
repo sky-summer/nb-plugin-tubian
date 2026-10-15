@@ -1,20 +1,21 @@
 """nonebot-plugin-tubian —— 星际争霸每周突变查询（QQ 官方机器人版）。
 
 根据「突变列表数据.xlsx」与当前时间自动选中本周突变并返回，
-支持查询下周突变、按序号或名称查询指定突变。
+支持查询下周突变、按序号查询，以及「突变查询 <名称>」按名称搜索。
 
-QQ 官方接口每条消息只接受一个媒体文件，本版将卡片拆为
-「文字卡 + 每因子（图标 + 名称）」多条消息发送，避免图标丢失。
+QQ 官方接口每条消息只接受一个媒体文件，本版将全部因子图标
+拼接为一张长图，作为单条消息的唯一媒体浮在文字卡上方。
 """
 
 from datetime import date, timedelta
 from functools import lru_cache
-from pathlib import Path
+from io import BytesIO
 from typing import NamedTuple
 
 from nonebot import on_command
 from nonebot.adapters import Bot, Event, Message
 from nonebot.adapters import MessageSegment as BaseMessageSegment
+from nonebot.matcher import Matcher
 from nonebot.message import event_preprocessor
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
@@ -39,7 +40,7 @@ __plugin_meta__ = PluginMetadata(
         "突变 — 查询本周突变（按当前时间自动选中）\n"
         "下周突变 — 查询下周突变\n"
         "突变 <序号> — 按轮换序号查询，如：突变 128\n"
-        "突变 <名称> — 按突变名称搜索，如：突变 恐惧神庙"
+        "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙"
     ),
     type="application",
     config=Config,
@@ -50,11 +51,13 @@ HELP_TEXT = (
     "突变 — 查询本周突变（按当前时间自动选中）\n"
     "下周突变 — 查询下周突变\n"
     "突变 <序号> — 按轮换序号查询，如：突变 128\n"
-    "突变 <名称> — 按突变名称搜索，如：突变 恐惧神庙"
+    "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙"
 )
 
+SEARCH_HINT = "名称查询请使用「突变查询 <名称>」，如：突变查询 恐惧神庙"
+
 # 与下方 on_command 注册保持一致
-_COMMAND_WORDS = ("突变", "下周突变", "本周突变", "tbx", "tb")
+_COMMAND_WORDS = ("突变", "突变查询", "下周突变", "本周突变", "tbx", "tb")
 
 _CURRENT_WORDS = {"本周", "这周", "当前", "now"}
 _NEXT_WORDS = {"下周", "下一周", "next"}
@@ -75,8 +78,8 @@ def _book() -> MutationBook:
     return MutationBook.load(config.tubian_data_dir)
 
 
-def _image_segment(bot: Bot, path: Path) -> BaseMessageSegment | None:
-    """按适配器构造图片消息段，不支持或读图失败时返回 None。
+def _image_segment(bot: Bot, data: bytes, file_name: str) -> BaseMessageSegment | None:
+    """按适配器构造图片消息段，不支持图片的适配器返回 None。
 
     图片内容以 bytes 传入：OneBot 侧会编码为 base64 发送。
     NapCat 等实现常与机器人不在同一文件系统（如各自 Docker 部署），
@@ -85,17 +88,63 @@ def _image_segment(bot: Bot, path: Path) -> BaseMessageSegment | None:
     adapter_name = bot.adapter.get_name()
     if "OneBot V11" not in adapter_name and "QQ" not in adapter_name:
         return None
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return None
     if "OneBot V11" in adapter_name:
         from nonebot.adapters.onebot.v11 import MessageSegment
 
         return MessageSegment.image(data)
     from nonebot.adapters.qq import MessageSegment
 
-    return MessageSegment.file_image(data, file_name=path.name)
+    return MessageSegment.file_image(data, file_name=file_name)
+
+
+def _icon_segment(bot: Bot, factor: str) -> BaseMessageSegment | None:
+    """构造单个因子图标消息段，图标缺失或读取失败时返回 None。"""
+    path = _book().icon_path(factor)
+    if path is None:
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return _image_segment(bot, data, path.name)
+
+
+_ICON_GAP = 12
+"""拼接因子图标时相邻图标间的像素间距。"""
+
+
+def _merged_factor_image(mutation: Mutation) -> bytes | None:
+    """把一期突变的全部因子图标横向拼为一张 PNG，无可用图标时返回 None。
+
+    图标缺失或损坏的因子被跳过；Pillow 未安装时同样返回 None，
+    调用方据此退化为纯文字卡片。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    icons = []
+    for factor in mutation.factors:
+        path = _book().icon_path(factor)
+        if path is None:
+            continue
+        try:
+            with Image.open(path) as icon:
+                icons.append(icon.convert("RGBA"))
+        except OSError:
+            continue
+    if not icons:
+        return None
+    width = sum(icon.width for icon in icons) + _ICON_GAP * (len(icons) - 1)
+    height = max(icon.height for icon in icons)
+    merged = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    offset = 0
+    for icon in icons:
+        merged.paste(icon, (offset, (height - icon.height) // 2))
+        offset += icon.width + _ICON_GAP
+    buffer = BytesIO()
+    merged.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _card_text(mutation: Mutation, label: str, note: str | None) -> tuple[str, str]:
@@ -108,38 +157,35 @@ def _card_text(mutation: Mutation, label: str, note: str | None) -> tuple[str, s
     today = local_today()
     if mutation.contains(today):
         header += f"剩余时间：{mutation.remaining_days(today)} 天\n"
-    footer = f"右侧数字：{mutation.number}" if mutation.number else ""
+    footer = f"因子分数：{mutation.number}" if mutation.number else ""
     if note:
         footer = f"{footer}\n{note}" if footer else note
     return header, footer
 
 
-def _split_cards(
+def _qq_card(
     bot: Bot, event: Event, mutation: Mutation, texts: tuple[str, str]
-) -> list[Message]:
-    """QQ：文字卡 + 每因子「图标 + 名称」各一条。"""
+) -> Message:
+    """QQ：全部因子图标拼为一张长图，作为单条消息的唯一媒体浮在文字上方。"""
     msg_cls = event.get_message().__class__
     header, footer = texts
     text = header
     if mutation.factors:
         text += "因子：\n"
         text += "".join(f"{factor}\n" for factor in mutation.factors)
-    cards = [msg_cls(text + footer)]
-    for factor in mutation.factors:
-        icon = _book().icon_path(factor)
-        segment = _image_segment(bot, icon) if icon else None
-        if segment is None:
-            continue
-        part = msg_cls()
-        part += segment
-        part += msg_cls(factor)
-        cards.append(part)
-    return cards
+    message = msg_cls()
+    image = _merged_factor_image(mutation)
+    if image is not None:
+        segment = _image_segment(bot, image, f"突变{mutation.mid}_因子.png")
+        if segment is not None:
+            message += segment
+    message += msg_cls(text + footer)
+    return message
 
 
 def _inline_card(
     bot: Bot, event: Event, mutation: Mutation, texts: tuple[str, str]
-) -> list[Message]:
+) -> Message:
     """单条消息内联全部因子图标（OneBot 等侧）。"""
     msg_cls = event.get_message().__class__
     header, footer = texts
@@ -147,28 +193,26 @@ def _inline_card(
     if mutation.factors:
         message += msg_cls("因子：\n")
         for factor in mutation.factors:
-            icon = _book().icon_path(factor)
-            segment = _image_segment(bot, icon) if icon else None
+            segment = _icon_segment(bot, factor)
             if segment is not None:
                 message += segment
             message += msg_cls(f"{factor}\n")
     if footer:
         message += msg_cls(footer)
-    return [message]
+    return message
 
 
-def _build_cards(
+def _build_card(
     bot: Bot, event: Event, mutation: Mutation, label: str, note: str | None = None
-) -> list[Message]:
-    """构造突变信息卡片，返回需依次发送的消息列表。
+) -> Message:
+    """构造突变信息卡片消息。
 
-    QQ 官方接口每条消息只接受一个媒体文件（多余的 file_image 段会被静默丢弃、
-    仅剩的一个作为 media 浮在文本上方），因此拆成多条发送；
-    OneBot 等侧保持一条消息内联图文。
+    QQ 官方接口每条消息只接受一个媒体文件（多余的 file_image 段会被静默丢弃），
+    故 QQ 侧把全部因子图标拼接为一张图发送；OneBot 等侧保持一条消息内联图文。
     """
     texts = _card_text(mutation, label, note)
     if "QQ" in bot.adapter.get_name():
-        return _split_cards(bot, event, mutation, texts)
+        return _qq_card(bot, event, mutation, texts)
     return _inline_card(bot, event, mutation, texts)
 
 
@@ -227,11 +271,25 @@ def _resolve_search(book: MutationBook, text: str, today: date) -> _Query:
 
 
 def _resolve_query(book: MutationBook, text: str, today: date) -> _Query:
-    """把指令参数解析为卡片参数或直接回复文本。"""
+    """把「突变」指令参数解析为卡片参数或直接回复文本。
+
+    名称查询已移至「突变查询」指令，非序号文本回复改用该指令的提示。
+    """
     if not text or text in _CURRENT_WORDS:
         return _Query(book.at(today), "本周突变")
     if text in _NEXT_WORDS:
         return _Query(book.at(today + timedelta(days=7)), "下周突变")
+    if text in _HELP_WORDS:
+        return _Query(None, reply=HELP_TEXT)
+    if text.isdigit():
+        return _resolve_number(book, text)
+    return _Query(None, reply=SEARCH_HINT)
+
+
+def _resolve_search_query(book: MutationBook, text: str, today: date) -> _Query:
+    """把「突变查询」指令参数解析为按名称（或序号）的查询。"""
+    if not text:
+        return _Query(None, reply=SEARCH_HINT)
     if text in _HELP_WORDS:
         return _Query(None, reply=HELP_TEXT)
     if text.isdigit():
@@ -290,7 +348,19 @@ def _ensure_command_prefixes() -> None:
 
 mutation_cmd = on_command("突变", aliases={"本周突变", "tb"}, priority=10, block=True)
 next_cmd = on_command("下周突变", aliases={"tbx"}, priority=10, block=True)
+search_cmd = on_command("突变查询", priority=10, block=True)
 _ensure_command_prefixes()
+
+
+async def _finish_query(
+    matcher: type[Matcher], bot: Bot, event: Event, query: _Query
+) -> None:
+    """回复查询结果：提示文本，或突变卡片。"""
+    if query.reply is not None:
+        await matcher.finish(query.reply)
+    assert query.mutation is not None
+    card = _build_card(bot, event, query.mutation, query.label, note=query.note)
+    await matcher.finish(card)
 
 
 @mutation_cmd.handle()
@@ -300,15 +370,9 @@ async def handle_mutation(bot: Bot, event: Event, arg: Message = CommandArg()) -
         book = _book()
     except MutationDataError as e:
         await mutation_cmd.finish(f"突变数据加载失败：{e}")
-
-    query = _resolve_query(book, text, local_today())
-    if query.reply is not None:
-        await mutation_cmd.finish(query.reply)
-    assert query.mutation is not None
-    cards = _build_cards(bot, event, query.mutation, query.label, note=query.note)
-    for card in cards[:-1]:
-        await mutation_cmd.send(card)
-    await mutation_cmd.finish(cards[-1])
+    await _finish_query(
+        mutation_cmd, bot, event, _resolve_query(book, text, local_today())
+    )
 
 
 @next_cmd.handle()
@@ -318,7 +382,16 @@ async def handle_next(bot: Bot, event: Event) -> None:
     except MutationDataError as e:
         await next_cmd.finish(f"突变数据加载失败：{e}")
     mutation = book.at(local_today() + timedelta(days=7))
-    cards = _build_cards(bot, event, mutation, "下周突变")
-    for card in cards[:-1]:
-        await next_cmd.send(card)
-    await next_cmd.finish(cards[-1])
+    await _finish_query(next_cmd, bot, event, _Query(mutation, "下周突变"))
+
+
+@search_cmd.handle()
+async def handle_search(bot: Bot, event: Event, arg: Message = CommandArg()) -> None:
+    text = arg.extract_plain_text().strip()
+    try:
+        book = _book()
+    except MutationDataError as e:
+        await search_cmd.finish(f"突变数据加载失败：{e}")
+    await _finish_query(
+        search_cmd, bot, event, _resolve_search_query(book, text, local_today())
+    )

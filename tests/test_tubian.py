@@ -10,6 +10,7 @@ import sys
 import unittest
 from datetime import date, timedelta
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,6 +18,7 @@ import nonebot
 from nonebot.adapters.onebot.v11 import Message as OB11Message
 from nonebot.adapters.onebot.v11 import MessageSegment as OB11MessageSegment
 from nonebot.rule import TrieRule
+from PIL import Image
 
 if TYPE_CHECKING:
     from nonebot.adapters import Bot, Event
@@ -164,17 +166,12 @@ class TestMessageCard(unittest.TestCase):
         cls.plugin_mod, cls.data_mod = _load()
         cls.book = cls.plugin_mod._book()
 
-    def _cards(
+    def _card(
         self, adapter_name: str, mutation: Any, label: str, note: str | None = None
-    ) -> list[Any]:
+    ) -> Any:
         bot = cast("Bot", _FakeBot(adapter_name))
         event = cast("Event", _FakeEvent())
-        return self.plugin_mod._build_cards(bot, event, mutation, label, note=note)
-
-    def _card(self, adapter_name: str, mutation: Any, label: str) -> Any:
-        cards = self._cards(adapter_name, mutation, label)
-        self.assertEqual(len(cards), 1, "单媒体适配器应只产出一条消息")
-        return cards[0]
+        return self.plugin_mod._build_card(bot, event, mutation, label, note=note)
 
     def test_card_text(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))
@@ -189,7 +186,7 @@ class TestMessageCard(unittest.TestCase):
     def test_card_number_field(self) -> None:
         mutation = self.book.get(3)
         text = self._card("OneBot V11", mutation, "突变 #3").extract_plain_text()
-        self.assertIn("右侧数字：7", text)
+        self.assertIn("因子分数：7", text)
 
     def test_card_remaining_time(self) -> None:
         today = self.data_mod.local_today()
@@ -217,34 +214,62 @@ class TestMessageCard(unittest.TestCase):
             )
 
     def test_card_images_qq(self) -> None:
-        """QQ 每条消息只接受一个媒体：拆为文字卡 + 每因子「图标 + 名称」各一条。"""
+        """QQ 每条消息只接受一个媒体：因子图标拼为一张长图，与文字卡同条发送。"""
         mutation = self.book.at(date(2026, 10, 15))
-        cards = self._cards("QQ", mutation, "本周突变")
-        self.assertEqual(len(cards), 4)  # 1 文字卡 + 3 因子
-        text_card = cards[0]
-        self.assertTrue(all(seg.type == "text" for seg in text_card))
-        text = text_card.extract_plain_text()
+        card = self._card("QQ", mutation, "本周突变")
+        images = [seg for seg in card if seg.type == "file_image"]
+        self.assertEqual(len(images), 1)
+        seg = images[0]
+        data = bytes(seg.data["content"])
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        self.assertTrue(str(seg.data["file_name"]).endswith(".png"))
+        text = card.extract_plain_text()
+        self.assertIn("【本周突变】恐惧神庙", text)
         for factor in ("异形寄生", "惧怕黑暗", "无边恐惧"):
             self.assertIn(factor, text)
-        for card, factor in zip(cards[1:], ("异形寄生", "惧怕黑暗", "无边恐惧")):
-            images = [seg for seg in card if seg.type == "file_image"]
-            self.assertEqual(len(images), 1, factor)
-            seg = images[0]
-            self.assertIsInstance(seg.data["content"], bytes)
-            self.assertTrue(bytes(seg.data["content"]).startswith(b"\x89PNG"))
-            self.assertTrue(str(seg.data["file_name"]).endswith(".png"))
-            self.assertEqual(card.extract_plain_text(), factor)
+
+    def test_merged_image_dimensions(self) -> None:
+        """拼接图宽度 = 各图标宽之和 + 间距，高度取最高图标。"""
+        mutation = self.book.at(date(2026, 10, 15))
+        data = self.plugin_mod._merged_factor_image(mutation)
+        assert data is not None
+        widths = []
+        heights = []
+        for factor in mutation.factors:
+            path = self.book.icon_path(factor)
+            assert path is not None
+            with Image.open(path) as icon:
+                widths.append(icon.width)
+                heights.append(icon.height)
+        gap = self.plugin_mod._ICON_GAP
+        with Image.open(BytesIO(data)) as merged:
+            self.assertEqual(merged.width, sum(widths) + gap * (len(widths) - 1))
+            self.assertEqual(merged.height, max(heights))
 
     def test_card_note(self) -> None:
         """重名优选时的提示附在文字卡尾部。"""
         mutation = self.book.at(date(2026, 10, 15))
-        cards = self._cards("OneBot V11", mutation, "本周突变", note="同名突变共 6 期")
-        self.assertIn("同名突变共 6 期", cards[0].extract_plain_text())
+        card = self._card("OneBot V11", mutation, "本周突变", note="同名突变共 6 期")
+        self.assertIn("同名突变共 6 期", card.extract_plain_text())
 
     def test_card_fallback_text_only(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))
         card = self._card("Other", mutation, "本周突变")
         self.assertTrue(all(seg.type == "text" for seg in card))
+
+    def test_card_fallback_without_icons(self) -> None:
+        """图标全部缺失时，QQ 卡片退化为纯文字，因子名称仍保留。"""
+        mutation = self.data_mod.Mutation(
+            mid=1,
+            name="测试突变",
+            map_name="测试地图",
+            start_date=date(2026, 10, 12),
+            factors=("不存在的因子",),
+        )
+        self.assertIsNone(self.plugin_mod._merged_factor_image(mutation))
+        card = self._card("QQ", mutation, "本周突变")
+        self.assertTrue(all(seg.type == "text" for seg in card))
+        self.assertIn("不存在的因子", card.extract_plain_text())
 
     def test_search_summary(self) -> None:
         found = self.book.search("灾难之轮")
@@ -303,15 +328,56 @@ class TestQueryRobustness(unittest.TestCase):
         self.plugin_mod._strip_command_prefix(msg2)
         self.assertEqual(msg2.extract_plain_text(), "本周突变")
 
+        msg3 = OB11Message(at) + OB11Message("突变查询 恐惧神庙")
+        self.plugin_mod._strip_command_prefix(msg3)
+        self.assertEqual(msg3.extract_plain_text(), "突变查询 恐惧神庙")
+
         other = OB11Message(at) + OB11Message("今天吃什么")
         self.plugin_mod._strip_command_prefix(other)
         self.assertEqual(other[0].type, "at")
 
     def test_command_prefix_fallback(self) -> None:
         """带/不带「/」的指令前缀都已注册，不依赖部署环境 COMMAND_START。"""
-        for word in ("突变", "本周突变", "tb", "下周突变", "tbx"):
+        for word in ("突变", "突变查询", "本周突变", "tb", "下周突变", "tbx"):
             self.assertIn(word, TrieRule.prefix, word)
             self.assertIn(f"/{word}", TrieRule.prefix, f"/{word}")
+
+    def test_command_trie_longest_prefix(self) -> None:
+        """「突变查询」不被「突变」抢占，按最长前缀解析为独立命令。"""
+        pf = TrieRule.prefix.longest_prefix("突变查询 恐惧神庙")
+        self.assertEqual(pf.key, "突变查询")
+        self.assertEqual(pf.value.command, ("突变查询",))
+
+    def test_resolve_query_rejects_name(self) -> None:
+        """「突变 <名称>」不再触发名称查询，回复改用「突变查询」的提示。"""
+        query = self.plugin_mod._resolve_query(
+            self.book, "恐惧神庙", date(2026, 10, 15)
+        )
+        self.assertIsNone(query.mutation)
+        assert query.reply is not None
+        self.assertIn("突变查询", query.reply)
+
+    def test_resolve_search_query(self) -> None:
+        """「突变查询 <名称>」按名称查询；序号同样可用。"""
+        query = self.plugin_mod._resolve_search_query(
+            self.book, "恐惧神庙", date(2026, 10, 15)
+        )
+        assert query.mutation is not None
+        self.assertEqual(query.mutation.mid, 128)
+        by_number = self.plugin_mod._resolve_search_query(
+            self.book, "128", date(2026, 10, 15)
+        )
+        assert by_number.mutation is not None
+        self.assertEqual(by_number.mutation.mid, 128)
+
+    def test_resolve_search_query_empty(self) -> None:
+        """「突变查询」缺参数时回复用法提示。"""
+        query = self.plugin_mod._resolve_search_query(
+            self.book, "", date(2026, 10, 15)
+        )
+        self.assertIsNone(query.mutation)
+        assert query.reply is not None
+        self.assertIn("突变查询", query.reply)
 
 
 class TestPluginSmoke(unittest.TestCase):
@@ -321,13 +387,13 @@ class TestPluginSmoke(unittest.TestCase):
         plugin = nonebot.get_plugin("tubian")
         assert plugin is not None
         self.assertEqual(plugin.name, "tubian")
-        self.assertEqual(len(plugin.matcher), 2)
+        self.assertEqual(len(plugin.matcher), 3)
 
     def test_metadata(self) -> None:
         plugin_mod, _ = _load()
         meta = plugin_mod.__plugin_meta__
         self.assertEqual(meta.name, "星际争霸每周突变")
-        self.assertIn("突变", meta.usage)
+        self.assertIn("突变查询 <名称>", meta.usage)
 
 
 if __name__ == "__main__":
