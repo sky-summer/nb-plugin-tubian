@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import nonebot
 from nonebot.adapters.onebot.v11 import Message as OB11Message
+from nonebot.adapters.onebot.v11 import MessageSegment as OB11MessageSegment
+from nonebot.rule import TrieRule
 
 if TYPE_CHECKING:
     from nonebot.adapters import Bot, Event
@@ -162,10 +164,17 @@ class TestMessageCard(unittest.TestCase):
         cls.plugin_mod, cls.data_mod = _load()
         cls.book = cls.plugin_mod._book()
 
-    def _card(self, adapter_name: str, mutation: Any, label: str) -> Any:
+    def _cards(
+        self, adapter_name: str, mutation: Any, label: str, note: str | None = None
+    ) -> list[Any]:
         bot = cast("Bot", _FakeBot(adapter_name))
         event = cast("Event", _FakeEvent())
-        return self.plugin_mod._build_card(bot, event, self.book, mutation, label)
+        return self.plugin_mod._build_cards(bot, event, mutation, label, note=note)
+
+    def _card(self, adapter_name: str, mutation: Any, label: str) -> Any:
+        cards = self._cards(adapter_name, mutation, label)
+        self.assertEqual(len(cards), 1, "单媒体适配器应只产出一条消息")
+        return cards[0]
 
     def test_card_text(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))
@@ -208,15 +217,29 @@ class TestMessageCard(unittest.TestCase):
             )
 
     def test_card_images_qq(self) -> None:
-        """QQ 侧传 bytes 而非路径，由适配器自行上传。"""
+        """QQ 每条消息只接受一个媒体：拆为文字卡 + 每因子「图标 + 名称」各一条。"""
         mutation = self.book.at(date(2026, 10, 15))
-        card = self._card("QQ", mutation, "本周突变")
-        images = [seg for seg in card if seg.type == "file_image"]
-        self.assertEqual(len(images), 3)
-        for seg in images:
+        cards = self._cards("QQ", mutation, "本周突变")
+        self.assertEqual(len(cards), 4)  # 1 文字卡 + 3 因子
+        text_card = cards[0]
+        self.assertTrue(all(seg.type == "text" for seg in text_card))
+        text = text_card.extract_plain_text()
+        for factor in ("异形寄生", "惧怕黑暗", "无边恐惧"):
+            self.assertIn(factor, text)
+        for card, factor in zip(cards[1:], ("异形寄生", "惧怕黑暗", "无边恐惧")):
+            images = [seg for seg in card if seg.type == "file_image"]
+            self.assertEqual(len(images), 1, factor)
+            seg = images[0]
             self.assertIsInstance(seg.data["content"], bytes)
             self.assertTrue(bytes(seg.data["content"]).startswith(b"\x89PNG"))
             self.assertTrue(str(seg.data["file_name"]).endswith(".png"))
+            self.assertEqual(card.extract_plain_text(), factor)
+
+    def test_card_note(self) -> None:
+        """重名优选时的提示附在文字卡尾部。"""
+        mutation = self.book.at(date(2026, 10, 15))
+        cards = self._cards("OneBot V11", mutation, "本周突变", note="同名突变共 6 期")
+        self.assertIn("同名突变共 6 期", cards[0].extract_plain_text())
 
     def test_card_fallback_text_only(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))
@@ -229,6 +252,66 @@ class TestMessageCard(unittest.TestCase):
         self.assertIn("找到 6 个", summary)
         self.assertIn("#11", summary)
         self.assertIn("突变 <序号>", summary)
+
+
+class TestQueryRobustness(unittest.TestCase):
+    """名称查询健壮性：标点宽度、重名优选、@ 前缀、指令前缀兜底。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plugin_mod, cls.data_mod = _load()
+        cls.book = cls.plugin_mod._book()
+
+    def test_search_normalizes_punctuation(self) -> None:
+        """全/半角标点混用的名称按任一宽度均可命中。"""
+        self.assertEqual(self.book.search("高举盾牌！")[0].name, "高举盾牌!")
+        self.assertEqual(self.book.search("高举盾牌!")[0].name, "高举盾牌!")
+        self.assertEqual(self.book.search("我的机器人!")[0].name, "我的机器人！")
+        self.assertEqual(self.book.search("我的机器人！")[0].name, "我的机器人！")
+
+    def test_exact_matches_and_prefer(self) -> None:
+        """重名时按名称精确命中，挑出距今最近的一期（2026-10-15 → #11）。"""
+        found = self.book.search("灾难之轮")
+        self.assertEqual(len(found), 6)
+        exact = self.plugin_mod._exact_matches(found, "灾难之轮")
+        self.assertEqual(len(exact), 6)
+        pick = self.plugin_mod._prefer_mutation(exact, date(2026, 10, 15))
+        self.assertEqual(pick.mid, 11)
+        # 本期命中的优先于「距今最近」
+        current = self.book.at(date(2026, 10, 15))
+        pick2 = self.plugin_mod._prefer_mutation(
+            [current, pick], date(2026, 10, 15)
+        )
+        self.assertEqual(pick2.mid, current.mid)
+
+    def test_exact_matches_rejects_partial(self) -> None:
+        """模糊命中（如按地图名）不做重名优选。"""
+        found = self.book.search("神庙")
+        self.assertTrue(found)
+        self.assertEqual(self.plugin_mod._exact_matches(found, "神庙"), [])
+
+    def test_strip_command_prefix(self) -> None:
+        """指令前的 at/reply 段被剥离；非本插件消息保持原样。"""
+        at = OB11MessageSegment.at(123)
+        msg = OB11Message(at) + OB11Message("突变 恐惧神庙")
+        self.plugin_mod._strip_command_prefix(msg)
+        self.assertEqual(msg[0].type, "text")
+        self.assertEqual(msg.extract_plain_text(), "突变 恐惧神庙")
+
+        reply = OB11MessageSegment.reply(1)
+        msg2 = OB11Message(reply) + OB11Message(at) + OB11Message("本周突变")
+        self.plugin_mod._strip_command_prefix(msg2)
+        self.assertEqual(msg2.extract_plain_text(), "本周突变")
+
+        other = OB11Message(at) + OB11Message("今天吃什么")
+        self.plugin_mod._strip_command_prefix(other)
+        self.assertEqual(other[0].type, "at")
+
+    def test_command_prefix_fallback(self) -> None:
+        """带/不带「/」的指令前缀都已注册，不依赖部署环境 COMMAND_START。"""
+        for word in ("突变", "本周突变", "tb", "下周突变", "tbx"):
+            self.assertIn(word, TrieRule.prefix, word)
+            self.assertIn(f"/{word}", TrieRule.prefix, f"/{word}")
 
 
 class TestPluginSmoke(unittest.TestCase):

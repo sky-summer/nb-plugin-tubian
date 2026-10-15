@@ -5,6 +5,7 @@
 全部 184 期构成一轮完整循环，超出数据覆盖范围时按整轮折算。
 """
 
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,15 @@ def fmt_date(value: date) -> str:
     """格式化日期为 YYYY/MM/DD（周X）。"""
     day = f"{value.year}/{value.month:02d}/{value.day:02d}"
     return f"{day}（{WEEKDAY_CN[value.weekday()]}）"
+
+
+def normalize_query(text: str) -> str:
+    """查询文本归一化：去首尾空白、NFKC 折算全角为半角、统一小写。
+
+    数据中的名称存在全/半角混用（如「我的机器人！」与「高举盾牌!」），
+    归一化后按任一宽度输入均可命中。
+    """
+    return unicodedata.normalize("NFKC", text.strip()).lower()
 
 
 @dataclass(frozen=True)
@@ -161,12 +171,15 @@ class MutationBook:
         return self._by_id.get(mid)
 
     def search(self, keyword: str) -> list[Mutation]:
-        """按突变名称或地图名称模糊搜索，按日期排序。"""
-        key = keyword.strip().lower()
+        """按突变名称或地图名称模糊搜索，按日期排序。
+
+        关键字与名称均做全/半角标点归一化，任一宽度输入均可命中。
+        """
+        key = normalize_query(keyword)
         return [
             m
             for m in self._chrono
-            if key in m.name.lower() or key in m.map_name.lower()
+            if key in normalize_query(m.name) or key in normalize_query(m.map_name)
         ]
 
     def at(self, when: date) -> Mutation:
