@@ -1,4 +1,6 @@
-"""残酷+（Brutal+）难度随机因子生成。
+"""残酷+（Brutal+）难度随机开局生成。
+
+每次生成一局完整的残酷+开局配置：因子组合、合作地图与埃蒙部队编制。
 
 残酷+ 在每周突变之上叠加额外因子，突变因子按强度赋 1～10 分，
 各难度档位对当期因子的点数总和与因子个数做筛选：
@@ -156,12 +158,74 @@ _POOL = tuple(sorted(FACTOR_POINTS, key=FACTOR_POINTS.__getitem__))
 """按分数升序排列的因子池，供组合枚举与剪枝使用。"""
 
 
+class AmonArmy(NamedTuple):
+    """一支埃蒙部队编制：种族与番号。"""
+
+    race: str
+    """种族名（星灵 / 人类 / 异虫）。"""
+
+    name: str
+    """部队番号。"""
+
+
+COOP_MAPS: tuple[str, ...] = (
+    "湮灭快车",
+    "虚空撕裂",
+    "虚空降临",
+    "克哈裂痕",
+    "往日神庙",
+    "天界封锁",
+    "升格之链",
+    "熔火危机",
+    "机会渺茫",
+    "营救矿工",
+    "亡者之夜",
+    "黑暗杀星",
+    "净网行动",
+    "聚铁成兵",
+    "死亡摇篮",
+)
+"""合作任务地图（共 15 张）。"""
+
+AMON_ARMIES: tuple[AmonArmy, ...] = (
+    # 星灵
+    AmonArmy("星灵", "大师机械"),
+    AmonArmy("星灵", "步战机甲"),
+    AmonArmy("星灵", "袭扰炮击"),
+    AmonArmy("星灵", "卡莱的希望"),
+    AmonArmy("星灵", "风暴迫临"),
+    AmonArmy("星灵", "暗影袭扰"),
+    AmonArmy("星灵", "艾尔先锋"),
+    AmonArmy("星灵", "族长之军"),
+    # 人类
+    AmonArmy("人类", "旧世步兵团"),
+    AmonArmy("人类", "突击团"),
+    AmonArmy("人类", "旧世机械团"),
+    AmonArmy("人类", "战争机械团"),
+    AmonArmy("人类", "暗影科技团"),
+    AmonArmy("人类", "帝国战斗群"),
+    # 异虫
+    AmonArmy("异虫", "肆虐扩散"),
+    AmonArmy("异虫", "滋生腐化"),
+    AmonArmy("异虫", "爆炸威胁"),
+    AmonArmy("异虫", "侵略虫群"),
+    AmonArmy("异虫", "遮天蔽日"),
+)
+"""埃蒙部队编制（共 19 支：星灵 8、人类 6、异虫 5）。"""
+
+
 @dataclass(frozen=True)
 class BrutalCombo:
-    """一次随机残酷+的结果：难度档位与选中的因子。"""
+    """一次随机残酷+的开局配置：难度、地图、埃蒙部队与因子组合。"""
 
     level: int
     """难度档位（1～6）。"""
+
+    map_name: str
+    """合作地图名。"""
+
+    army: AmonArmy
+    """本局埃蒙部队编制。"""
 
     factors: tuple[str, ...]
     """因子名称，按分数从高到低排列。"""
@@ -221,11 +285,11 @@ def _combo_groups(level: int) -> tuple[tuple[tuple[str, ...], ...], ...]:
 
 
 def random_brutal(level: int, rng: random.Random | None = None) -> BrutalCombo:
-    """按难度规律随机生成一组因子组合。
+    """按难度规律随机生成一局残酷+开局。
 
     因子个数先在允许范围内均匀取值，再在该个数的全部合法组合中
     均匀抽取，避免个数多的组合数量占优时几乎抽不出个数少的组合
-    （如残酷+6 的双 10 分因子）。
+    （如残酷+6 的双 10 分因子）；地图与埃蒙部队在各自池中均匀抽取。
     """
     if level not in BRUTAL_RULES:
         raise ValueError(f"未知的残酷+难度：{level}")
@@ -236,7 +300,12 @@ def random_brutal(level: int, rng: random.Random | None = None) -> BrutalCombo:
         raise ValueError(f"残酷+{level}无合法组合")
     factors = rng.choice(rng.choice(groups))
     ordered = tuple(sorted(factors, key=lambda name: -FACTOR_POINTS[name]))
-    return BrutalCombo(level=level, factors=ordered)
+    return BrutalCombo(
+        level=level,
+        map_name=rng.choice(COOP_MAPS),
+        army=rng.choice(AMON_ARMIES),
+        factors=ordered,
+    )
 
 
 def parse_brutal_level(text: str) -> int | None:

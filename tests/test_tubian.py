@@ -133,6 +133,12 @@ class TestMutationBook(unittest.TestCase):
         self.assertTrue(icon.is_file())
         self.assertIsNone(self.book.icon_path("不存在的因子"))
 
+    def test_map_icon_path(self) -> None:
+        icon = self.book.map_icon_path("往日神庙")
+        assert icon is not None
+        self.assertTrue(icon.is_file())
+        self.assertIsNone(self.book.map_icon_path("不存在的地图"))
+
     def test_icons_deduped_by_factor_name(self) -> None:
         """图标目录只保留 因子_<名称>.png，全部因子可按名称通用获取。"""
         icon_dir = Path(self.data_dir) / "因子图标"
@@ -201,7 +207,7 @@ class TestMessageCard(unittest.TestCase):
         mutation = self.book.at(date(2026, 10, 15))
         card = self._card("OneBot V11", mutation, "本周突变")
         images = [seg for seg in card if seg.type == "image"]
-        self.assertEqual(len(images), 3)
+        self.assertEqual(len(images), 1 + len(mutation.factors))  # 地图 + 因子
         for seg in images:
             file = str(seg.data["file"])
             self.assertTrue(file.startswith("base64://"), file[:32])
@@ -225,10 +231,14 @@ class TestMessageCard(unittest.TestCase):
             self.assertIn(factor, text)
 
     def test_merged_image_dimensions(self) -> None:
-        """拼接图宽度 = 各图标宽之和 + 间距，高度取最高图标。"""
+        """拼接图：地图置顶，因子图标在其下横排一行。"""
         mutation = self.book.at(date(2026, 10, 15))
-        data = self.plugin_mod._merged_factor_image(mutation.factors)
+        data = self.plugin_mod._merged_card_image(mutation.map_name, mutation.factors)
         assert data is not None
+        map_path = self.book.map_icon_path(mutation.map_name)
+        assert map_path is not None
+        with Image.open(map_path) as map_img:
+            map_width, map_height = map_img.width, map_img.height
         widths = []
         heights = []
         for factor in mutation.factors:
@@ -238,9 +248,10 @@ class TestMessageCard(unittest.TestCase):
                 widths.append(icon.width)
                 heights.append(icon.height)
         gap = self.plugin_mod._ICON_GAP
+        factors_width = sum(widths) + gap * (len(widths) - 1)
         with Image.open(BytesIO(data)) as merged:
-            self.assertEqual(merged.width, sum(widths) + gap * (len(widths) - 1))
-            self.assertEqual(merged.height, max(heights))
+            self.assertEqual(merged.width, max(map_width, factors_width))
+            self.assertEqual(merged.height, map_height + gap + max(heights))
 
     def test_card_note(self) -> None:
         """重名优选时的提示附在文字卡尾部。"""
@@ -262,7 +273,7 @@ class TestMessageCard(unittest.TestCase):
             start_date=date(2026, 10, 12),
             factors=("不存在的因子",),
         )
-        self.assertIsNone(self.plugin_mod._merged_factor_image(mutation.factors))
+        self.assertIsNone(self.plugin_mod._merged_card_image(mutation.map_name, mutation.factors))
         card = self._card("QQ", mutation, "本周突变")
         self.assertTrue(all(seg.type == "text" for seg in card))
         self.assertIn("不存在的因子", card.extract_plain_text())
@@ -507,22 +518,54 @@ class TestBrutalRandom(unittest.TestCase):
         self.assertIsNone(parse("10"))
         self.assertIsNone(parse("abc"))
 
+    def test_coop_maps(self) -> None:
+        """合作地图共 15 张，无重复。"""
+        maps = self.brutal_mod.COOP_MAPS
+        self.assertEqual(len(maps), 15)
+        self.assertEqual(len(set(maps)), 15)
+
+    def test_coop_map_icons(self) -> None:
+        """全部合作地图都有图片。"""
+        for name in self.brutal_mod.COOP_MAPS:
+            self.assertIsNotNone(self.book.map_icon_path(name), f"缺少地图图片：{name}")
+
+    def test_amon_armies(self) -> None:
+        """埃蒙部队共 19 支：星灵 8、人类 6、异虫 5，番号不重复。"""
+        armies = self.brutal_mod.AMON_ARMIES
+        self.assertEqual(len(armies), 19)
+        by_race: dict[str, int] = {}
+        for army in armies:
+            by_race[army.race] = by_race.get(army.race, 0) + 1
+        self.assertEqual(by_race, {"星灵": 8, "人类": 6, "异虫": 5})
+        names = [army.name for army in armies]
+        self.assertEqual(len(set(names)), 19)
+
+    def test_random_brutal_includes_map_and_army(self) -> None:
+        """每次生成都附带池内的地图与埃蒙部队编制。"""
+        rng = random.Random(20261019)
+        for _ in range(50):
+            combo = self.brutal_mod.random_brutal(rng.randint(1, 6), rng)
+            self.assertIn(combo.map_name, self.brutal_mod.COOP_MAPS)
+            self.assertIn(combo.army, self.brutal_mod.AMON_ARMIES)
+
     def test_brutal_card_text(self) -> None:
         combo = self.brutal_mod.random_brutal(3, random.Random(7))
         bot = cast("Bot", _FakeBot("OneBot V11"))
         text = self.plugin_mod._brutal_card(bot, combo).extract_plain_text()
         self.assertIn("【随机残酷+3】", text)
+        self.assertIn(f"地图：{combo.map_name}", text)
+        self.assertIn(f"埃蒙部队：{combo.army.race} · {combo.army.name}", text)
         self.assertIn(f"点数总和：{combo.total}", text)
         self.assertIn("（残酷+3 规则：点数 9～10 · 因子 2～3 个）", text)
         for name, points in zip(combo.factors, combo.points):
             self.assertIn(f"{name}（{points}分）", text)
 
     def test_brutal_card_images(self) -> None:
-        """OneBot 侧每个因子一个内联图标；QQ 侧拼为一张图。"""
+        """OneBot 侧地图与每个因子各一个内联图标；QQ 侧拼为一张图。"""
         combo = self.brutal_mod.random_brutal(6, random.Random(11))
         card = self.plugin_mod._brutal_card(cast("Bot", _FakeBot("OneBot V11")), combo)
         images = [seg for seg in card if seg.type == "image"]
-        self.assertEqual(len(images), len(combo.factors))
+        self.assertEqual(len(images), 1 + len(combo.factors))  # 地图 + 因子
 
         qq_card = self.plugin_mod._brutal_card(cast("Bot", _FakeBot("QQ")), combo)
         qq_images = [seg for seg in qq_card if seg.type == "file_image"]
@@ -698,7 +741,6 @@ class TestPluginSmoke(unittest.TestCase):
         self.assertIn("突变查询 <名称>", meta.usage)
         self.assertIn("因子查询 <名称>", meta.usage)
         self.assertIn("随机残酷 [1~6]", meta.usage)
-        self.assertIn("订阅突变", meta.usage)
         self.assertIn("帮助 / help", meta.usage)
 
     def test_help_command_registered(self) -> None:
@@ -713,7 +755,7 @@ class TestPluginSmoke(unittest.TestCase):
         self.assertEqual(pf2.value.command, ("help",))
 
     def test_help_text_lists_all_commands(self) -> None:
-        """帮助文本覆盖插件全部指令（含别名）。"""
+        """帮助文本覆盖插件全部指令（含别名；推送指令已下线，不列）。"""
         plugin_mod, _ = _load()
         for phrase in (
             "突变 / 本周突变 / tb",
@@ -722,8 +764,6 @@ class TestPluginSmoke(unittest.TestCase):
             "突变查询 <名称>",
             "因子查询 <名称> / 因子 <名称>",
             "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck",
-            "订阅突变 / 退订突变",
-            "测试推送",
             "帮助 / help",
         ):
             self.assertIn(phrase, plugin_mod.HELP_TEXT)

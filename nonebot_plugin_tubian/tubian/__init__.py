@@ -2,7 +2,7 @@
 
 根据「突变列表数据.xlsx」与当前时间自动选中本周突变并返回，
 支持查询下周突变、按序号查询、「突变查询 <名称>」按名称搜索，
-「随机残酷 [1~6]」按因子点数规律随机生成残酷+因子组合，
+「随机残酷 [1~6]」随机生成残酷+开局（因子组合、地图与埃蒙部队），
 以及「订阅突变」定时推送：每周一 08:00 向订阅会话发送本周突变，
 主动消息无权限时随会话的下一条消息补发（被动回复，无需该权限）。
 
@@ -60,8 +60,8 @@ __plugin_meta__ = PluginMetadata(
         "突变 <序号> — 按轮换序号查询，如：突变 128\n"
         "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
         "因子查询 <名称> / 因子 <名称> — 查询单个因子效果，如：因子查询 短视症\n"
-        "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 按点数规律随机生成残酷+因子组合，如：随机残酷 3\n"
-        # "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
+        "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，如：随机残酷 3\n"
+        "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
         # "测试推送 — 立即执行一次推送任务（测试用）\n"
         "帮助 / help — 查看全部功能"
     ),
@@ -76,11 +76,10 @@ HELP_TEXT = (
     "突变 <序号> — 按轮换序号查询，如：突变 128\n"
     "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
     "因子查询 <名称> / 因子 <名称> — 查询单个因子效果，如：因子查询 短视症\n"
-    "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 按点数规律随机生成残酷+因子组合，如：随机残酷 3\n"
-    # "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
+    "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，如：随机残酷 3\n"
+    "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
     # "测试推送 — 立即执行一次推送任务（测试用）\n"
     "帮助 / help — 查看全部功能\n"
-    "作者：当然是最最最伟大的墨墨之王啦，有什么好的提议可以沟通，官方bot限制很多，我尽可能去调整适配"
 )
 
 SEARCH_HINT = "名称查询请使用「突变查询 <名称>」，如：突变查询 恐惧神庙"
@@ -93,8 +92,8 @@ FACTOR_USAGE_HINT = (
 
 BRUTAL_USAGE_HINT = (
     "随机残酷用法：\n"
-    "随机残酷 — 随机 1～6 难度并生成因子组合\n"
-    "随机残酷 <1~6> — 生成指定难度的因子组合，如：随机残酷 3"
+    "随机残酷 — 随机 1～6 难度并生成开局（因子组合、地图与埃蒙部队）\n"
+    "随机残酷 <1~6> — 生成指定难度的开局，如：随机残酷 3"
 )
 
 # 与下方 on_command 注册保持一致
@@ -111,9 +110,9 @@ _COMMAND_WORDS = (
     "残酷随机",
     "残酷+",
     "sjck",
-    # "订阅突变（不可用）",
-    # "退订突变（不可用）",
-    # "测试推送（不可用）",
+    "订阅突变",
+    "退订突变",
+    "测试推送（测试使用勿用！！！！！）",
     "帮助",
     "help",
     "usage",
@@ -188,20 +187,41 @@ def _icon_segment(bot: Bot, factor: str) -> BaseMessageSegment | None:
     return _image_segment(bot, data, path.name)
 
 
+def _map_icon_segment(bot: Bot, map_name: str) -> BaseMessageSegment | None:
+    """构造单张地图图片消息段，图片缺失或读取失败时返回 None。"""
+    path = _book().map_icon_path(map_name)
+    if path is None:
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return _image_segment(bot, data, path.name)
+
+
 _ICON_GAP = 12
 """拼接因子图标时相邻图标间的像素间距。"""
 
 
-def _merged_factor_image(factors: tuple[str, ...]) -> bytes | None:
-    """把一组因子的图标横向拼为一张 PNG，无可用图标时返回 None。
+def _merged_card_image(map_name: str | None, factors: tuple[str, ...]) -> bytes | None:
+    """把地图图片与一组因子图标拼为一张 PNG，无可用图片时返回 None。
 
-    图标缺失或损坏的因子被跳过；Pillow 未安装时同样返回 None，
-    调用方据此退化为纯文字卡片。
+    地图图片置顶，因子图标在其下横排一行；图标缺失或损坏的因子被跳过；
+    Pillow 未安装时同样返回 None，调用方据此退化为纯文字卡片。
     """
     try:
         from PIL import Image
     except ImportError:
         return None
+    map_icon = None
+    if map_name:
+        path = _book().map_icon_path(map_name)
+        if path is not None:
+            try:
+                with Image.open(path) as im:
+                    map_icon = im.convert("RGBA")
+            except OSError:
+                map_icon = None
     icons = []
     for factor in factors:
         path = _book().icon_path(factor)
@@ -212,14 +232,24 @@ def _merged_factor_image(factors: tuple[str, ...]) -> bytes | None:
                 icons.append(icon.convert("RGBA"))
         except OSError:
             continue
-    if not icons:
+    if map_icon is None and not icons:
         return None
-    width = sum(icon.width for icon in icons) + _ICON_GAP * (len(icons) - 1)
-    height = max(icon.height for icon in icons)
+    factors_width = (
+        sum(icon.width for icon in icons) + _ICON_GAP * (len(icons) - 1) if icons else 0
+    )
+    factors_height = max((icon.height for icon in icons), default=0)
+    width = max(map_icon.width if map_icon is not None else 0, factors_width)
+    height = factors_height
+    if map_icon is not None:
+        height += map_icon.height + (_ICON_GAP if icons else 0)
     merged = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    offset = 0
+    y = 0
+    if map_icon is not None:
+        merged.paste(map_icon, ((width - map_icon.width) // 2, y))
+        y += map_icon.height + (_ICON_GAP if icons else 0)
+    offset = (width - factors_width) // 2
     for icon in icons:
-        merged.paste(icon, (offset, (height - icon.height) // 2))
+        merged.paste(icon, (offset, y + (factors_height - icon.height) // 2))
         offset += icon.width + _ICON_GAP
     buffer = BytesIO()
     merged.save(buffer, format="PNG")
@@ -243,7 +273,7 @@ def _card_text(mutation: Mutation, label: str, note: str | None) -> tuple[str, s
 
 
 class _CardParts(NamedTuple):
-    """一张因子卡片的内容：头尾文字、因子及其展示行、拼图文件名。"""
+    """一张卡片的内容：头尾文字、地图与因子及其展示行、拼图文件名。"""
 
     header: str
     footer: str
@@ -256,16 +286,19 @@ class _CardParts(NamedTuple):
     image_name: str
     """QQ 侧拼接图的文件名。"""
 
+    map_name: str | None = None
+    """合作地图名，用于取地图图片；None 表示不配地图图。"""
+
 
 def _qq_card(bot: Bot, parts: _CardParts) -> Message:
-    """QQ：全部因子图标拼为一张长图，作为单条消息的唯一媒体浮在文字上方。"""
+    """QQ：地图与全部因子图标拼为一张长图，作为单条消息的唯一媒体浮在文字上方。"""
     msg_cls = _message_class(bot)
     text = parts.header
     if parts.factor_lines:
         text += "因子：\n"
         text += "".join(f"{line}\n" for line in parts.factor_lines)
     message = msg_cls()
-    image = _merged_factor_image(parts.factors)
+    image = _merged_card_image(parts.map_name, parts.factors)
     if image is not None:
         segment = _image_segment(bot, image, parts.image_name)
         if segment is not None:
@@ -275,9 +308,14 @@ def _qq_card(bot: Bot, parts: _CardParts) -> Message:
 
 
 def _inline_card(bot: Bot, parts: _CardParts) -> Message:
-    """单条消息内联全部因子图标（OneBot 等侧）。"""
+    """单条消息内联地图与全部因子图标（OneBot 等侧）。"""
     msg_cls = _message_class(bot)
-    message = msg_cls(parts.header)
+    message = msg_cls()
+    if parts.map_name:
+        segment = _map_icon_segment(bot, parts.map_name)
+        if segment is not None:
+            message += segment
+    message += msg_cls(parts.header)
     if parts.factor_lines:
         message += msg_cls("因子：\n")
         for factor, line in zip(parts.factors, parts.factor_lines):
@@ -294,7 +332,7 @@ def _factor_card(bot: Bot, parts: _CardParts) -> Message:
     """按适配器选择卡片形态构造消息。
 
     QQ 官方接口每条消息只接受一个媒体文件（多余的 file_image 段会被静默丢弃），
-    故 QQ 侧把全部因子图标拼接为一张图发送；OneBot 等侧保持一条消息内联图文。
+    故 QQ 侧把地图与全部因子图标拼接为一张图发送；OneBot 等侧保持一条消息内联图文。
     """
     if "QQ" in bot.adapter.get_name():
         return _qq_card(bot, parts)
@@ -312,15 +350,20 @@ def _build_card(
         factors=mutation.factors,
         factor_lines=mutation.factors,
         image_name=f"突变{mutation.mid}_因子.png",
+        map_name=mutation.map_name,
     )
     return _factor_card(bot, parts)
 
 
 def _brutal_card(bot: Bot, combo: BrutalCombo) -> Message:
-    """构造随机残酷+结果卡片：因子带分数，尾部附点数小结与档位规律。"""
+    """构造随机残酷+结果卡片：地图、埃蒙部队、因子带分数，尾部附点数小结。"""
     rule = combo.rule
     parts = _CardParts(
-        header=f"【随机残酷+{combo.level}】\n",
+        header=(
+            f"【随机残酷+{combo.level}】\n"
+            f"地图：{combo.map_name}\n"
+            f"埃蒙部队：{combo.army.race} · {combo.army.name}\n"
+        ),
         footer=(
             f"点数总和：{combo.total} · 因子数：{len(combo.factors)}\n"
             f"（残酷+{combo.level} 规则：点数 {rule.min_total}～{rule.max_total}"
@@ -331,6 +374,7 @@ def _brutal_card(bot: Bot, combo: BrutalCombo) -> Message:
             f"{name}（{points}分）" for name, points in zip(combo.factors, combo.points)
         ),
         image_name=f"随机残酷{combo.level}_因子.png",
+        map_name=combo.map_name,
     )
     return _factor_card(bot, parts)
 

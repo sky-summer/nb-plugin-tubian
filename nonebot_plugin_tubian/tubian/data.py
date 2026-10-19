@@ -14,6 +14,7 @@ from openpyxl import load_workbook
 
 EXCEL_NAME = "突变列表数据.xlsx"
 ICON_DIR_NAME = "因子图标"
+MAP_ICON_DIR_NAME = "地图图标"
 WEEK_DAYS = 7
 WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -124,13 +125,16 @@ def _parse_row(row: tuple[object, ...]) -> Mutation | None:
 class MutationBook:
     """全部突变数据，支持按时间、序号、名称选中。"""
 
-    def __init__(self, mutations: list[Mutation], icon_dir: Path) -> None:
+    def __init__(
+        self, mutations: list[Mutation], icon_dir: Path, map_icon_dir: Path
+    ) -> None:
         by_id = {m.mid: m for m in mutations}
         if not by_id:
             raise MutationDataError("突变数据为空")
         self._by_id = by_id
         self._chrono = sorted(by_id.values(), key=lambda m: m.start_date)
         self.icon_dir = icon_dir
+        self.map_icon_dir = map_icon_dir
 
     @classmethod
     def load(cls, data_dir: Path) -> "MutationBook":
@@ -159,7 +163,11 @@ class MutationBook:
         finally:
             if workbook is not None:
                 workbook.close()
-        return cls(list(items.values()), data_dir / ICON_DIR_NAME)
+        return cls(
+            list(items.values()),
+            data_dir / ICON_DIR_NAME,
+            data_dir / MAP_ICON_DIR_NAME,
+        )
 
     @property
     def count(self) -> int:
@@ -197,4 +205,9 @@ class MutationBook:
     def icon_path(self, factor: str) -> Path | None:
         """返回因子图标路径，不存在则返回 None。"""
         path = self.icon_dir / f"因子_{factor}.png"
+        return path if path.is_file() else None
+
+    def map_icon_path(self, map_name: str) -> Path | None:
+        """返回地图图片路径，不存在则返回 None。"""
+        path = self.map_icon_dir / f"{map_name}.png"
         return path if path.is_file() else None
