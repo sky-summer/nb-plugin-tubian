@@ -2,12 +2,17 @@
 
 根据「突变列表数据.xlsx」与当前时间自动选中本周突变并返回，
 支持查询下周突变、按序号查询、「突变查询 <名称>」按名称搜索，
-「随机残酷 [1~6]」随机生成残酷+开局（因子组合、地图与埃蒙部队），
+「随机残酷 [1~6]」随机生成残酷+开局（因子组合、地图与埃蒙部队，
+追加「指挥官」再随机两位指挥官并附头像），
 以及「订阅突变」定时推送：每周一 08:00 向订阅会话发送本周突变，
 主动消息无权限时随会话的下一条消息补发（被动回复，无需该权限）。
 
-QQ 官方接口每条消息只接受一个媒体文件，本版将全部因子图标
-拼接为一张长图，作为单条消息的唯一媒体浮在文字卡上方。
+突变详情卡片按数据表附带推荐指挥官（含威望与头像）、
+注意事项、保底位（大主教）与推荐原因。
+
+QQ 官方接口每条消息只接受一个媒体文件，本版将地图图片、
+推荐指挥官头像与全部因子图标拼接为一张长图，
+作为单条消息的唯一媒体浮在文字卡上方。
 """
 
 import asyncio
@@ -15,7 +20,8 @@ import random
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from io import BytesIO
-from typing import NamedTuple
+from pathlib import Path
+from typing import Any, NamedTuple
 
 from nonebot import get_driver, logger, on_command, on_message
 from nonebot.adapters import Bot, Event, Message
@@ -26,7 +32,7 @@ from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import TRIE_VALUE, TrieRule
 
-from .brutal import MAX_LEVEL, BrutalCombo, parse_brutal_level, random_brutal
+from .brutal import MAX_LEVEL, BrutalCombo, parse_brutal_args, random_brutal
 from .config import Config, config
 from .data import (
     Mutation,
@@ -55,12 +61,12 @@ __plugin_meta__ = PluginMetadata(
     name="星际争霸每周突变",
     description="根据突变列表 Excel 与当前时间，自动选中本周突变并返回",
     usage=(
-        "突变 / 本周突变 / tb — 查询本周突变（按当前时间自动选中）\n"
+        "突变 / 本周突变 / tb — 查询本周突变（含因子、地图、推荐指挥官与注意事项）\n"
         "下周突变 / tbx — 查询下周突变\n"
         "突变 <序号> — 按轮换序号查询，如：突变 128\n"
         "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
         "因子查询 <名称> / 因子 <名称> — 查询单个因子效果，如：因子查询 短视症\n"
-        "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，如：随机残酷 3\n"
+        "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，追加「指挥官」再随机两位指挥官，如：随机残酷 3 指挥官\n"
         "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
         # "测试推送 — 立即执行一次推送任务（测试用）\n"
         "帮助 / help — 查看全部功能"
@@ -71,12 +77,12 @@ __plugin_meta__ = PluginMetadata(
 
 HELP_TEXT = (
     "星际争霸每周突变查询 全部功能：\n"
-    "突变 / 本周突变 / tb — 查询本周突变（按当前时间自动选中）\n"
+    "突变 / 本周突变 / tb — 查询本周突变（含因子、地图、推荐指挥官与注意事项）\n"
     "下周突变 / tbx — 查询下周突变\n"
     "突变 <序号> — 按轮换序号查询，如：突变 128\n"
     "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
     "因子查询 <名称> / 因子 <名称> — 查询单个因子效果，如：因子查询 短视症\n"
-    "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，如：随机残酷 3\n"
+    "随机残酷 [1~6] / 残酷随机 / 残酷+<N> / sjck — 随机残酷+开局：因子组合、地图与埃蒙部队，追加「指挥官」再随机两位指挥官，如：随机残酷 3 指挥官\n"
     "订阅突变 / 退订突变 — 订阅/取消每周一 08:00 的本周突变推送\n"
     # "测试推送 — 立即执行一次推送任务（测试用）\n"
     "帮助 / help — 查看全部功能\n"
@@ -93,7 +99,8 @@ FACTOR_USAGE_HINT = (
 BRUTAL_USAGE_HINT = (
     "随机残酷用法：\n"
     "随机残酷 — 随机 1～6 难度并生成开局（因子组合、地图与埃蒙部队）\n"
-    "随机残酷 <1~6> — 生成指定难度的开局，如：随机残酷 3"
+    "随机残酷 <1~6> — 生成指定难度的开局，如：随机残酷 3\n"
+    "追加「指挥官」— 额外随机两位指挥官并附头像，如：随机残酷 3 指挥官"
 )
 
 # 与下方 on_command 注册保持一致
@@ -199,58 +206,80 @@ def _map_icon_segment(bot: Bot, map_name: str) -> BaseMessageSegment | None:
     return _image_segment(bot, data, path.name)
 
 
+def _commander_icon_segment(bot: Bot, commander: str) -> BaseMessageSegment | None:
+    """构造单张指挥官头像消息段，头像缺失或读取失败时返回 None。"""
+    path = _book().commander_icon_path(commander)
+    if path is None:
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return _image_segment(bot, data, path.name)
+
+
 _ICON_GAP = 12
 """拼接因子图标时相邻图标间的像素间距。"""
 
 
-def _merged_card_image(map_name: str | None, factors: tuple[str, ...]) -> bytes | None:
-    """把地图图片与一组因子图标拼为一张 PNG，无可用图片时返回 None。
-
-    地图图片置顶，因子图标在其下横排一行；图标缺失或损坏的因子被跳过；
-    Pillow 未安装时同样返回 None，调用方据此退化为纯文字卡片。
-    """
+def _load_rgba(path: Path | None) -> Any:
+    """以 RGBA 打开一张图片；路径缺失、读取失败或 Pillow 未安装时返回 None。"""
+    if path is None:
+        return None
     try:
         from PIL import Image
-    except ImportError:
+
+        with Image.open(path) as im:
+            return im.convert("RGBA")
+    except (ImportError, OSError):
         return None
-    map_icon = None
-    if map_name:
-        path = _book().map_icon_path(map_name)
-        if path is not None:
-            try:
-                with Image.open(path) as im:
-                    map_icon = im.convert("RGBA")
-            except OSError:
-                map_icon = None
-    icons = []
-    for factor in factors:
-        path = _book().icon_path(factor)
-        if path is None:
-            continue
-        try:
-            with Image.open(path) as icon:
-                icons.append(icon.convert("RGBA"))
-        except OSError:
-            continue
-    if map_icon is None and not icons:
+
+
+def _merged_card_image(
+    map_name: str | None,
+    factors: tuple[str, ...],
+    commanders: tuple[str, ...] = (),
+) -> bytes | None:
+    """把地图图片、指挥官头像与一组因子图标拼为一张 PNG，无可用图片时返回 None。
+
+    地图图片置顶，其下依次为指挥官头像行与因子图标行，各行水平居中；
+    图标缺失或损坏的项被跳过；Pillow 未安装时同样返回 None，
+    调用方据此退化为纯文字卡片。
+    """
+    map_icon = _load_rgba(_book().map_icon_path(map_name)) if map_name else None
+    rows = []
+    for names, lookup in (
+        (commanders, _book().commander_icon_path),
+        (factors, _book().icon_path),
+    ):
+        row = [icon for name in names if (icon := _load_rgba(lookup(name))) is not None]
+        if row:
+            rows.append(row)
+    if map_icon is None and not rows:
         return None
-    factors_width = (
-        sum(icon.width for icon in icons) + _ICON_GAP * (len(icons) - 1) if icons else 0
-    )
-    factors_height = max((icon.height for icon in icons), default=0)
-    width = max(map_icon.width if map_icon is not None else 0, factors_width)
-    height = factors_height
+    from PIL import Image
+
+    rows_width = [
+        sum(icon.width for icon in row) + _ICON_GAP * (len(row) - 1) for row in rows
+    ]
+    rows_height = [max(icon.height for icon in row) for row in rows]
+    width = max(map_icon.width if map_icon is not None else 0, *rows_width)
+    height = sum(rows_height) + _ICON_GAP * (len(rows) - 1)
     if map_icon is not None:
-        height += map_icon.height + (_ICON_GAP if icons else 0)
+        height += map_icon.height + (_ICON_GAP if rows else 0)
     merged = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     y = 0
     if map_icon is not None:
         merged.paste(map_icon, ((width - map_icon.width) // 2, y))
-        y += map_icon.height + (_ICON_GAP if icons else 0)
-    offset = (width - factors_width) // 2
-    for icon in icons:
-        merged.paste(icon, (offset, y + (factors_height - icon.height) // 2))
-        offset += icon.width + _ICON_GAP
+        y += map_icon.height + (_ICON_GAP if rows else 0)
+    for index, (row, row_width, row_height) in enumerate(
+        zip(rows, rows_width, rows_height)
+    ):
+        offset = (width - row_width) // 2
+        for icon in row:
+            merged.paste(icon, (offset, y + (row_height - icon.height) // 2))
+            offset += icon.width + _ICON_GAP
+        y += row_height + (_ICON_GAP if index + 1 < len(rows) else 0)
     buffer = BytesIO()
     merged.save(buffer, format="PNG")
     return buffer.getvalue()
@@ -289,16 +318,31 @@ class _CardParts(NamedTuple):
     map_name: str | None = None
     """合作地图名，用于取地图图片；None 表示不配地图图。"""
 
+    commanders: tuple[str, ...] = ()
+    """指挥官名称，用于取头像；空元组表示不配指挥官。"""
+
+    commander_lines: tuple[str, ...] = ()
+    """指挥官展示行（如附带威望）；非空时逐行展示，与 commanders 对应取头像。"""
+
+    extra_lines: tuple[str, ...] = ()
+    """因子行之后、结尾文字之前的附加行（注意事项、保底位、推荐原因等）。"""
+
 
 def _qq_card(bot: Bot, parts: _CardParts) -> Message:
-    """QQ：地图与全部因子图标拼为一张长图，作为单条消息的唯一媒体浮在文字上方。"""
+    """QQ：地图、指挥官与全部因子图标拼为一张长图，作为单条消息的唯一媒体浮在文字上方。"""
     msg_cls = _message_class(bot)
     text = parts.header
+    if parts.commander_lines:
+        text += "推荐指挥官：\n"
+        text += "".join(f"{line}\n" for line in parts.commander_lines)
+    elif parts.commanders:
+        text += f"指挥官：{'、'.join(parts.commanders)}\n"
     if parts.factor_lines:
         text += "因子：\n"
         text += "".join(f"{line}\n" for line in parts.factor_lines)
+    text += "".join(f"{line}\n" for line in parts.extra_lines)
     message = msg_cls()
-    image = _merged_card_image(parts.map_name, parts.factors)
+    image = _merged_card_image(parts.map_name, parts.factors, parts.commanders)
     if image is not None:
         segment = _image_segment(bot, image, parts.image_name)
         if segment is not None:
@@ -307,8 +351,30 @@ def _qq_card(bot: Bot, parts: _CardParts) -> Message:
     return message
 
 
+def _append_commander_text(
+    msg_cls: type[Message], message: Message, parts: _CardParts
+) -> None:
+    """追加指挥官文字行：带威望时逐行展示，否则沿用「指挥官：A、B」。"""
+    if parts.commander_lines:
+        message += msg_cls("推荐指挥官：\n")
+        for line in parts.commander_lines:
+            message += msg_cls(f"{line}\n")
+    else:
+        message += msg_cls(f"指挥官：{'、'.join(parts.commanders)}\n")
+
+
+def _append_commander_icons(
+    bot: Bot, message: Message, commanders: tuple[str, ...]
+) -> None:
+    """把指挥官头像逐个追加到消息。"""
+    for commander in commanders:
+        segment = _commander_icon_segment(bot, commander)
+        if segment is not None:
+            message += segment
+
+
 def _inline_card(bot: Bot, parts: _CardParts) -> Message:
-    """单条消息内联地图与全部因子图标（OneBot 等侧）。"""
+    """单条消息内联地图、指挥官头像与全部因子图标（OneBot 等侧）。"""
     msg_cls = _message_class(bot)
     message = msg_cls()
     if parts.map_name:
@@ -316,6 +382,9 @@ def _inline_card(bot: Bot, parts: _CardParts) -> Message:
         if segment is not None:
             message += segment
     message += msg_cls(parts.header)
+    if parts.commanders:
+        _append_commander_text(msg_cls, message, parts)
+        _append_commander_icons(bot, message, parts.commanders)
     if parts.factor_lines:
         message += msg_cls("因子：\n")
         for factor, line in zip(parts.factors, parts.factor_lines):
@@ -323,6 +392,8 @@ def _inline_card(bot: Bot, parts: _CardParts) -> Message:
             if segment is not None:
                 message += segment
             message += msg_cls(f"{line}\n")
+    for line in parts.extra_lines:
+        message += msg_cls(f"{line}\n")
     if parts.footer:
         message += msg_cls(parts.footer)
     return message
@@ -342,21 +413,38 @@ def _factor_card(bot: Bot, parts: _CardParts) -> Message:
 def _build_card(
     bot: Bot, mutation: Mutation, label: str, note: str | None = None
 ) -> Message:
-    """构造突变信息卡片消息。"""
+    """构造突变信息卡片消息：因子与推荐指挥官图标、注意事项与推荐攻略。"""
     header, footer = _card_text(mutation, label, note)
+    picks = mutation.commanders
+    commander_lines = [pick.display for pick in picks]
+    if mutation.bonus is not None:
+        picks = (*picks, mutation.bonus)
+        commander_lines.append(f"保底位：{mutation.bonus.display}")
+    extra_lines = []
+    if mutation.notes:
+        extra_lines.append("注意事项：")
+        extra_lines.append(mutation.notes)
+    if mutation.reason:
+        extra_lines.append(f"推荐原因：{mutation.reason}")
     parts = _CardParts(
         header=header,
         footer=footer,
         factors=mutation.factors,
         factor_lines=mutation.factors,
-        image_name=f"突变{mutation.mid}_因子.png",
+        image_name=f"突变{mutation.mid}_详情.png",
         map_name=mutation.map_name,
+        commanders=tuple(pick.name for pick in picks),
+        commander_lines=tuple(commander_lines),
+        extra_lines=tuple(extra_lines),
     )
     return _factor_card(bot, parts)
 
 
 def _brutal_card(bot: Bot, combo: BrutalCombo) -> Message:
-    """构造随机残酷+结果卡片：地图、埃蒙部队、因子带分数，尾部附点数小结。"""
+    """构造随机残酷+结果卡片：地图、埃蒙部队、因子带分数，尾部附点数小结。
+
+    combo.commanders 非空时附指挥官名单与头像。
+    """
     rule = combo.rule
     parts = _CardParts(
         header=(
@@ -375,6 +463,7 @@ def _brutal_card(bot: Bot, combo: BrutalCombo) -> Message:
         ),
         image_name=f"随机残酷{combo.level}_因子.png",
         map_name=combo.map_name,
+        commanders=combo.commanders,
     )
     return _factor_card(bot, parts)
 
@@ -760,10 +849,11 @@ async def handle_brutal(bot: Bot, arg: Message = CommandArg()) -> None:
     text = arg.extract_plain_text().strip()
     if text in _HELP_WORDS:
         await brutal_cmd.finish(HELP_TEXT)
-    level = parse_brutal_level(text) if text else random.randint(1, MAX_LEVEL)
-    if level is None:
+    args = parse_brutal_args(text)
+    if args is None:
         await brutal_cmd.finish(BRUTAL_USAGE_HINT)
-    combo = random_brutal(level)
+    level = args.level if args.level is not None else random.randint(1, MAX_LEVEL)
+    combo = random_brutal(level, with_commanders=args.with_commanders)
     try:
         card = _brutal_card(bot, combo)
     except MutationDataError as e:

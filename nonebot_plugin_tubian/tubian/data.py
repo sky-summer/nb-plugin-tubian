@@ -3,6 +3,9 @@
 数据来源：「突变列表数据.xlsx」（《星际争霸》每周突变数据表）。
 每期突变自其「日期」（周一）起开放 7 天，按周轮换；
 全部 184 期构成一轮完整循环，超出数据覆盖范围时按整轮折算。
+
+除基础轮换信息外，每期还携带推荐指挥官（含威望）、注意事项、
+保底位（第 4 位，固定阿塔尼斯）与推荐原因，用于详情展示。
 """
 
 import unicodedata
@@ -15,6 +18,7 @@ from openpyxl import load_workbook
 EXCEL_NAME = "突变列表数据.xlsx"
 ICON_DIR_NAME = "因子图标"
 MAP_ICON_DIR_NAME = "地图图标"
+COMMANDER_ICON_DIR_NAME = "指挥官图标"
 WEEK_DAYS = 7
 WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -22,6 +26,17 @@ _LIST_SHEET = "突变列表"
 _LIST_SHEET_START = 2
 _CURRENT_SHEET = "本周突变"
 _CURRENT_SHEET_START = 3
+
+COMMANDER_ICON_ALIASES: dict[str, str] = {
+    "斯图科夫": "斯托科夫",
+    "霍纳与汉": "米拉·汉",
+    "霍纳": "米拉·汉",
+    "卡拉克斯": "凯拉克斯",
+}
+"""指挥官译名别名 → 图标库文件名（同一人物的不同译法）。"""
+
+_ROW_WIDTH = 21
+"""突变列表一行的完整列数（序号～推荐原因）。"""
 
 
 class MutationDataError(Exception):
@@ -49,6 +64,22 @@ def normalize_query(text: str) -> str:
 
 
 @dataclass(frozen=True)
+class CommanderPick:
+    """一位推荐指挥官：名称与推荐威望。"""
+
+    name: str
+    """指挥官名称。"""
+
+    prestige: str = ""
+    """推荐威望（如「P2 最佳伙伴」）；P0 表示原版，缺失时为空串。"""
+
+    @property
+    def display(self) -> str:
+        """展示文本：带威望时形如「斯台特曼（P2 最佳伙伴）」。"""
+        return f"{self.name}（{self.prestige}）" if self.prestige else self.name
+
+
+@dataclass(frozen=True)
 class Mutation:
     """一期每周突变。"""
 
@@ -69,6 +100,18 @@ class Mutation:
 
     number: str | None = None
     """原图右侧数字，缺失或为「/」时为 None。"""
+
+    commanders: tuple[CommanderPick, ...] = ()
+    """推荐指挥官（1～3 位，按推荐顺序：首选、互补、备选）。"""
+
+    notes: str = ""
+    """注意事项：地图打法要点与因子应对建议。"""
+
+    bonus: CommanderPick | None = None
+    """第 4 位保底/情怀位（固定阿塔尼斯，守护之壳容错）。"""
+
+    reason: str = ""
+    """保底位的推荐原因（恶搞口吻的点评）。"""
 
     @property
     def end_date(self) -> date:
@@ -98,9 +141,26 @@ def _parse_date(value: object) -> date:
         raise MutationDataError(f"无法解析日期：{value!r}") from e
 
 
+def _parse_text(value: object) -> str:
+    """单元格文本：None 视为空串，其余去首尾空白。"""
+    return "" if value is None else str(value).strip()
+
+
+def _parse_pick(
+    row: tuple[object, ...], name_col: int, prestige_col: int
+) -> CommanderPick | None:
+    """解析一组「推荐指挥官 + 推荐威望」列，指挥官为空时返回 None。"""
+    name = _parse_text(row[name_col])
+    if not name:
+        return None
+    return CommanderPick(name, _parse_text(row[prestige_col]))
+
+
 def _parse_row(row: tuple[object, ...]) -> Mutation | None:
     if row[0] is None:
         return None
+    if len(row) < _ROW_WIDTH:
+        row = row + (None,) * (_ROW_WIDTH - len(row))
     try:
         mid = int(str(row[0]).strip())
     except ValueError as e:
@@ -112,6 +172,11 @@ def _parse_row(row: tuple[object, ...]) -> Mutation | None:
     )
     raw_number = "" if row[10] is None else str(row[10]).strip()
     number = raw_number if raw_number and raw_number not in {"/", "／", "-"} else None
+    commanders = tuple(
+        pick
+        for name_col, prestige_col in ((11, 12), (13, 14), (15, 16))
+        if (pick := _parse_pick(row, name_col, prestige_col)) is not None
+    )
     return Mutation(
         mid=mid,
         name=str(row[1]).strip(),
@@ -119,6 +184,10 @@ def _parse_row(row: tuple[object, ...]) -> Mutation | None:
         start_date=_parse_date(row[3]),
         factors=factors,
         number=number,
+        commanders=commanders,
+        notes=_parse_text(row[17]),
+        bonus=_parse_pick(row, 18, 19),
+        reason=_parse_text(row[20]),
     )
 
 
@@ -126,7 +195,11 @@ class MutationBook:
     """全部突变数据，支持按时间、序号、名称选中。"""
 
     def __init__(
-        self, mutations: list[Mutation], icon_dir: Path, map_icon_dir: Path
+        self,
+        mutations: list[Mutation],
+        icon_dir: Path,
+        map_icon_dir: Path,
+        commander_icon_dir: Path,
     ) -> None:
         by_id = {m.mid: m for m in mutations}
         if not by_id:
@@ -135,6 +208,7 @@ class MutationBook:
         self._chrono = sorted(by_id.values(), key=lambda m: m.start_date)
         self.icon_dir = icon_dir
         self.map_icon_dir = map_icon_dir
+        self.commander_icon_dir = commander_icon_dir
 
     @classmethod
     def load(cls, data_dir: Path) -> "MutationBook":
@@ -167,6 +241,7 @@ class MutationBook:
             list(items.values()),
             data_dir / ICON_DIR_NAME,
             data_dir / MAP_ICON_DIR_NAME,
+            data_dir / COMMANDER_ICON_DIR_NAME,
         )
 
     @property
@@ -210,4 +285,14 @@ class MutationBook:
     def map_icon_path(self, map_name: str) -> Path | None:
         """返回地图图片路径，不存在则返回 None。"""
         path = self.map_icon_dir / f"{map_name}.png"
+        return path if path.is_file() else None
+
+    def commander_icon_path(self, commander: str) -> Path | None:
+        """返回指挥官头像路径，不存在则返回 None。
+
+        数据表与图标库对同一指挥官存在译名差异（如「斯图科夫」与
+        「斯托科夫」、「霍纳与汉」与「米拉·汉」），按别名折算后再查。
+        """
+        name = COMMANDER_ICON_ALIASES.get(commander, commander)
+        path = self.commander_icon_dir / f"{name}.png"
         return path if path.is_file() else None

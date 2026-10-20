@@ -11,6 +11,7 @@ import random
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from io import BytesIO
@@ -78,6 +79,8 @@ class TestMutationBook(unittest.TestCase):
         self.assertEqual(Path(self.data_dir).resolve(), DATA_DIR.resolve())
         self.assertTrue((Path(self.data_dir) / "突变列表数据.xlsx").is_file())
         self.assertTrue((Path(self.data_dir) / "因子图标").is_dir())
+        self.assertTrue((Path(self.data_dir) / "地图图标").is_dir())
+        self.assertTrue((Path(self.data_dir) / "指挥官图标").is_dir())
 
     def test_load_count(self) -> None:
         self.assertEqual(self.book.count, 184)
@@ -127,6 +130,37 @@ class TestMutationBook(unittest.TestCase):
         self.assertEqual(self.book.get(3).number, "7")
         self.assertIsNone(self.book.get(128).number)  # 原表为「/」
 
+    def test_recommendation_fields(self) -> None:
+        """推荐指挥官（含威望）、注意事项、保底位与推荐原因均被解析。"""
+        mutation = self.book.get(128)
+        assert mutation is not None
+        self.assertEqual(
+            [p.name for p in mutation.commanders], ["斯台特曼", "泽拉图", "凯拉克斯"]
+        )
+        self.assertEqual(
+            [p.prestige for p in mutation.commanders],
+            ["P2 最佳伙伴", "P2 知识探求者", "P1 战争建筑师"],
+        )
+        self.assertTrue(mutation.notes.startswith("①长图守三路"))
+        assert mutation.bonus is not None
+        self.assertEqual(mutation.bonus.name, "阿塔尼斯")
+        self.assertIn("我大主教还需要用哪个威望", mutation.bonus.prestige)
+        self.assertTrue(mutation.reason.startswith("往日神庙守三路"))
+
+    def test_commander_pick_display(self) -> None:
+        """带威望时展示为「名称（威望）」，无威望时仅名称。"""
+        CommanderPick = self.data_mod.CommanderPick
+        self.assertEqual(CommanderPick("凯瑞甘", "P0").display, "凯瑞甘（P0）")
+        self.assertEqual(CommanderPick("雷诺").display, "雷诺")
+
+    def test_all_mutations_have_recommendations(self) -> None:
+        """每期都有 3 位推荐指挥官、保底位、注意事项与推荐原因。"""
+        for m in self.book._by_id.values():
+            self.assertEqual(len(m.commanders), 3, f"#{m.mid} 推荐指挥官不足 3 位")
+            self.assertIsNotNone(m.bonus, f"#{m.mid} 缺少保底位")
+            self.assertTrue(m.notes, f"#{m.mid} 缺少注意事项")
+            self.assertTrue(m.reason, f"#{m.mid} 缺少推荐原因")
+
     def test_icon_path(self) -> None:
         icon = self.book.icon_path("异形寄生")
         assert icon is not None
@@ -138,6 +172,41 @@ class TestMutationBook(unittest.TestCase):
         assert icon is not None
         self.assertTrue(icon.is_file())
         self.assertIsNone(self.book.map_icon_path("不存在的地图"))
+
+    def test_all_maps_have_icons(self) -> None:
+        """全部期次的地图图片均可命中（数据表地图名与图标库一致）。"""
+        for m in self.book._by_id.values():
+            self.assertIsNotNone(
+                self.book.map_icon_path(m.map_name),
+                f"#{m.mid} 缺少地图图片：{m.map_name}",
+            )
+
+    def test_all_recommended_commanders_have_icons(self) -> None:
+        """数据表中的推荐指挥官（含保底位）都能取到头像。"""
+        names = {p.name for m in self.book._by_id.values() for p in m.commanders}
+        for m in self.book._by_id.values():
+            if m.bonus is not None:
+                names.add(m.bonus.name)
+        for name in names:
+            self.assertIsNotNone(
+                self.book.commander_icon_path(name), f"缺少指挥官头像：{name}"
+            )
+
+    def test_commander_icon_aliases(self) -> None:
+        """译名别名均可命中头像库文件。"""
+        for name in (
+            "斯图科夫",
+            "斯托科夫",
+            "霍纳与汉",
+            "霍纳",
+            "卡拉克斯",
+            "凯拉克斯",
+            "米拉·汉",
+        ):
+            self.assertIsNotNone(
+                self.book.commander_icon_path(name), f"缺少指挥官头像：{name}"
+            )
+        self.assertIsNone(self.book.commander_icon_path("不存在的指挥官"))
 
     def test_icons_deduped_by_factor_name(self) -> None:
         """图标目录只保留 因子_<名称>.png，全部因子可按名称通用获取。"""
@@ -207,7 +276,10 @@ class TestMessageCard(unittest.TestCase):
         mutation = self.book.at(date(2026, 10, 15))
         card = self._card("OneBot V11", mutation, "本周突变")
         images = [seg for seg in card if seg.type == "image"]
-        self.assertEqual(len(images), 1 + len(mutation.factors))  # 地图 + 因子
+        bonus = () if mutation.bonus is None else (mutation.bonus,)
+        picks = (*mutation.commanders, *bonus)
+        # 地图 + 推荐指挥官（含保底位）+ 因子
+        self.assertEqual(len(images), 1 + len(picks) + len(mutation.factors))
         for seg in images:
             file = str(seg.data["file"])
             self.assertTrue(file.startswith("base64://"), file[:32])
@@ -253,11 +325,75 @@ class TestMessageCard(unittest.TestCase):
             self.assertEqual(merged.width, max(map_width, factors_width))
             self.assertEqual(merged.height, map_height + gap + max(heights))
 
+    def test_merged_image_commander_row(self) -> None:
+        """指挥官头像行夹在地图与因子行之间。"""
+        mutation = self.book.at(date(2026, 10, 15))
+        commanders = ("雷诺", "凯瑞甘")
+        data = self.plugin_mod._merged_card_image(
+            mutation.map_name, mutation.factors, commanders
+        )
+        assert data is not None
+        map_path = self.book.map_icon_path(mutation.map_name)
+        assert map_path is not None
+        with Image.open(map_path) as map_img:
+            map_width, map_height = map_img.width, map_img.height
+        gap = self.plugin_mod._ICON_GAP
+
+        def row_size(names: tuple[str, ...], lookup: Any) -> tuple[int, int]:
+            widths = []
+            heights = []
+            for name in names:
+                path = lookup(name)
+                assert path is not None
+                with Image.open(path) as icon:
+                    widths.append(icon.width)
+                    heights.append(icon.height)
+            return sum(widths) + gap * (len(widths) - 1), max(heights)
+
+        cmdr_width, cmdr_height = row_size(commanders, self.book.commander_icon_path)
+        factor_width, factor_height = row_size(mutation.factors, self.book.icon_path)
+        with Image.open(BytesIO(data)) as merged:
+            self.assertEqual(
+                merged.width, max(map_width, cmdr_width, factor_width)
+            )
+            self.assertEqual(
+                merged.height,
+                map_height + gap + cmdr_height + gap + factor_height,
+            )
+
     def test_card_note(self) -> None:
         """重名优选时的提示附在文字卡尾部。"""
         mutation = self.book.at(date(2026, 10, 15))
         card = self._card("OneBot V11", mutation, "本周突变", note="同名突变共 6 期")
         self.assertIn("同名突变共 6 期", card.extract_plain_text())
+
+    def test_card_recommendation_text(self) -> None:
+        """详情卡片包含推荐指挥官（含威望）、注意事项、保底位与推荐原因。"""
+        mutation = self.book.at(date(2026, 10, 15))
+        text = self._card("OneBot V11", mutation, "本周突变").extract_plain_text()
+        self.assertIn("推荐指挥官：", text)
+        self.assertIn("斯台特曼（P2 最佳伙伴）", text)
+        self.assertIn("泽拉图（P2 知识探求者）", text)
+        self.assertIn("凯拉克斯（P1 战争建筑师）", text)
+        self.assertIn("保底位：阿塔尼斯", text)
+        self.assertIn("注意事项：", text)
+        self.assertIn(mutation.notes, text)
+        self.assertIn(f"推荐原因：{mutation.reason}", text)
+
+    def test_card_recommendation_qq(self) -> None:
+        """QQ 侧详情文字齐全，推荐指挥官头像拼入唯一媒体图。"""
+        mutation = self.book.at(date(2026, 10, 15))
+        card = self._card("QQ", mutation, "本周突变")
+        text = card.extract_plain_text()
+        self.assertIn("推荐指挥官：", text)
+        self.assertIn("斯台特曼（P2 最佳伙伴）", text)
+        self.assertIn("保底位：阿塔尼斯", text)
+        self.assertIn("注意事项：", text)
+        images = [seg for seg in card if seg.type == "file_image"]
+        self.assertEqual(len(images), 1)
+        data = bytes(images[0].data["content"])
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        self.assertEqual(str(images[0].data["file_name"]), f"突变{mutation.mid}_详情.png")
 
     def test_card_fallback_text_only(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))
@@ -461,20 +597,86 @@ class TestBrutalRandom(unittest.TestCase):
             ],
         )
 
-    def test_all_counts_have_combos(self) -> None:
-        """每一档、每个允许的因子个数都有合法组合，且组合全部满足规律。"""
+    def test_score_profiles_valid(self) -> None:
+        """分数构成枚举：无重复、满足档位规律、分值降序、可实例化。"""
         for level, rule in self.brutal_mod.BRUTAL_RULES.items():
-            groups = self.brutal_mod._combo_groups(level)
-            self.assertEqual(len(groups), rule.max_count - rule.min_count + 1)
-            counts = range(rule.min_count, rule.max_count + 1)
-            for count, group in zip(counts, groups):
-                self.assertTrue(group, f"残酷+{level} 的 {count} 因子组合为空")
-                for factors in group:
-                    total = sum(self.brutal_mod.FACTOR_POINTS[f] for f in factors)
-                    self.assertTrue(
-                        rule.allows(total, len(factors)),
-                        f"残酷+{level} 组合 {factors} 总分 {total} 不满足规律",
+            profiles = self.brutal_mod._score_profiles(level)
+            self.assertTrue(profiles, f"残酷+{level} 无合法构成")
+            seen: set[tuple[int, ...]] = set()
+            for profile in profiles:
+                self.assertNotIn(profile, seen, f"残酷+{level} 构成重复：{profile}")
+                seen.add(profile)
+                self.assertEqual(
+                    list(profile), sorted(profile, reverse=True), (level, profile)
+                )
+                self.assertTrue(
+                    rule.allows(sum(profile), len(profile)),
+                    f"残酷+{level} 构成 {profile} 不满足规律",
+                )
+                for score, need in Counter(profile).items():
+                    self.assertLessEqual(
+                        need,
+                        len(self.brutal_mod._BY_SCORE[score]),
+                        f"残酷+{level} 构成 {profile} 超出 {score} 分因子数",
                     )
+
+    def test_score_profiles_counts_covered(self) -> None:
+        """每一档、每个允许的因子个数都有合法分数构成。"""
+        for level, rule in self.brutal_mod.BRUTAL_RULES.items():
+            lengths = {len(p) for p in self.brutal_mod._score_profiles(level)}
+            self.assertEqual(
+                lengths,
+                set(range(rule.min_count, rule.max_count + 1)),
+                f"残酷+{level} 缺少某个因子个数的构成",
+            )
+
+    def test_score_profiles_expectation(self) -> None:
+        """手工核对残酷+6 构成数与含 10 分构成数。"""
+        profiles = self.brutal_mod._score_profiles(6)
+        self.assertEqual(len(profiles), 70)
+        self.assertEqual(sum(1 for p in profiles if 10 in p), 24)
+        self.assertEqual(sum(1 for p in profiles if p.count(10) >= 2), 1)  # (10,10)
+
+    def test_random_brutal_10_factor_frequency(self) -> None:
+        """按分数构成均匀抽取：残酷+6 双 10 罕见、10 分因子期望受控。
+
+        旧实现（按组合均匀）双 10 约 33%、每局 10 分期望约 1.14。
+        """
+        rng = random.Random(20261020)
+        trials = 3000
+        double10 = 0
+        any10 = 0
+        total10 = 0
+        for _ in range(trials):
+            combo = self.brutal_mod.random_brutal(6, rng)
+            n10 = sum(
+                1 for f in combo.factors if self.brutal_mod.FACTOR_POINTS[f] == 10
+            )
+            double10 += n10 >= 2
+            any10 += n10 >= 1
+            total10 += n10
+        self.assertLess(double10, trials * 0.05)
+        self.assertLess(any10, trials * 0.60)
+        self.assertLess(total10, trials * 0.8)
+
+    def test_random_brutal_low_level_no_10_factor(self) -> None:
+        """低档（残酷+1～3）总分不超过 10，任何开局都不含 10 分因子。"""
+        rng = random.Random(20261019)
+        for _ in range(300):
+            combo = self.brutal_mod.random_brutal(rng.randint(1, 3), rng)
+            for factor in combo.factors:
+                self.assertLess(self.brutal_mod.FACTOR_POINTS[factor], 10)
+
+    def test_random_brutal_profile_coverage(self) -> None:
+        """多次抽取应覆盖该档绝大部分分数构成（每种分数体验都能出现）。"""
+        rng = random.Random(20261021)
+        drawn = set()
+        for _ in range(800):
+            combo = self.brutal_mod.random_brutal(6, rng)
+            drawn.add(combo.points)
+        all_profiles = set(self.brutal_mod._score_profiles(6))
+        self.assertGreaterEqual(len(drawn), len(all_profiles) * 0.9)
+        self.assertLessEqual(drawn, all_profiles)
 
     def test_random_brutal_satisfies_rules(self) -> None:
         """随机结果始终满足所在档位的点数与个数规律。"""
@@ -517,6 +719,47 @@ class TestBrutalRandom(unittest.TestCase):
         self.assertIsNone(parse("7"))
         self.assertIsNone(parse("10"))
         self.assertIsNone(parse("abc"))
+
+    def test_commanders_pool(self) -> None:
+        """指挥官共 18 位（「汉和霍纳」分列），无重复，且都有头像。"""
+        commanders = self.brutal_mod.COMMANDERS
+        self.assertEqual(len(commanders), 18)
+        self.assertEqual(len(set(commanders)), 18)
+        for name in commanders:
+            self.assertIsNotNone(
+                self.book.commander_icon_path(name), f"缺少指挥官头像：{name}"
+            )
+
+    def test_random_brutal_with_commanders(self) -> None:
+        """开启指挥官随机时抽取两位不重复的池内指挥官，关闭时为空。"""
+        rng = random.Random(20261020)
+        for _ in range(30):
+            combo = self.brutal_mod.random_brutal(
+                rng.randint(1, 6), rng, with_commanders=True
+            )
+            self.assertEqual(len(combo.commanders), 2)
+            self.assertEqual(len(set(combo.commanders)), 2)
+            for name in combo.commanders:
+                self.assertIn(name, self.brutal_mod.COMMANDERS)
+            self.assertEqual(
+                self.brutal_mod.random_brutal(rng.randint(1, 6), rng).commanders, ()
+            )
+
+    def test_parse_brutal_args(self) -> None:
+        """「指挥官」开关与难度可一起解析；无法识别时返回 None。"""
+        parse = self.brutal_mod.parse_brutal_args
+        self.assertEqual(parse(""), (None, False))
+        self.assertEqual(parse("3"), (3, False))
+        self.assertEqual(parse("指挥官"), (None, True))
+        self.assertEqual(parse("随机指挥官"), (None, True))
+        self.assertEqual(parse("3指挥官"), (3, True))
+        self.assertEqual(parse("指挥官3"), (3, True))
+        self.assertEqual(parse("随机残酷 3 指挥官"), (3, True))
+        self.assertEqual(parse("残酷+3 指挥官"), (3, True))
+        self.assertEqual(parse("３指挥官"), (3, True))  # 全角数字
+        self.assertIsNone(parse("abc"))
+        self.assertIsNone(parse("7指挥官"))
+        self.assertIn("指挥官", self.plugin_mod.BRUTAL_USAGE_HINT)
 
     def test_coop_maps(self) -> None:
         """合作地图共 15 张，无重复。"""
@@ -574,6 +817,22 @@ class TestBrutalRandom(unittest.TestCase):
         self.assertEqual(
             str(qq_images[0].data["file_name"]), f"随机残酷{combo.level}_因子.png"
         )
+
+    def test_brutal_card_with_commanders(self) -> None:
+        """开启指挥官随机时文字带指挥官行，图标数随之增加。"""
+        combo = self.brutal_mod.random_brutal(3, random.Random(3), with_commanders=True)
+        bot = cast("Bot", _FakeBot("OneBot V11"))
+        card = self.plugin_mod._brutal_card(bot, combo)
+        text = card.extract_plain_text()
+        self.assertIn(f"指挥官：{'、'.join(combo.commanders)}", text)
+        images = [seg for seg in card if seg.type == "image"]
+        self.assertEqual(len(images), 1 + len(combo.commanders) + len(combo.factors))
+
+        qq_card = self.plugin_mod._brutal_card(cast("Bot", _FakeBot("QQ")), combo)
+        qq_images = [seg for seg in qq_card if seg.type == "file_image"]
+        self.assertEqual(len(qq_images), 1)
+        qq_text = qq_card.extract_plain_text()
+        self.assertIn(f"指挥官：{'、'.join(combo.commanders)}", qq_text)
 
     def test_brutal_command_registered(self) -> None:
         """指令已注册；「残酷+3」按最长前缀解析为「残酷+」命令。"""

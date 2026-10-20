@@ -1,6 +1,7 @@
 """残酷+（Brutal+）难度随机开局生成。
 
-每次生成一局完整的残酷+开局配置：因子组合、合作地图与埃蒙部队编制。
+每次生成一局完整的残酷+开局配置：因子组合、合作地图与埃蒙部队编制，
+可选附带两位随机指挥官。
 
 残酷+ 在每周突变之上叠加额外因子，突变因子按强度赋 1～10 分，
 各难度档位对当期因子的点数总和与因子个数做筛选：
@@ -12,10 +13,18 @@
 - 残酷+5：点数总和 15～16，因子 2～4 个
 - 残酷+6：点数总和 19～20，因子 2～4 个
 
+因子选取分两层：先在本档全部合法「分数构成」（如残酷+6 的
+(10,10)、(10,7,3)、(8,7,5)、(7,6,6,1) 等）中均匀抽取一种，
+再在该构成下从各分值池随机抽取具体因子。按构成均匀而非按
+组合均匀，可避免组合数量多的分数形态（如含 10 分因子者）
+占据过高频率——残酷+6 的双 10 分开局因此从约三分之一概率
+降至约百分之二，各档分数体验更为均衡。
+
 限定因子（节日特供，不参与轮换）与未实装因子不参与随机。
 """
 
 import random
+from collections import Counter
 from dataclasses import dataclass
 from functools import cache
 from typing import NamedTuple
@@ -154,8 +163,18 @@ BRUTAL_RULES: dict[int, BrutalRule] = {
 MAX_LEVEL = max(BRUTAL_RULES)
 """最高难度档位。"""
 
-_POOL = tuple(sorted(FACTOR_POINTS, key=FACTOR_POINTS.__getitem__))
-"""按分数升序排列的因子池，供组合枚举与剪枝使用。"""
+_score_groups: dict[int, list[str]] = {}
+for _name, _score in FACTOR_POINTS.items():
+    _score_groups.setdefault(_score, []).append(_name)
+_BY_SCORE: dict[int, tuple[str, ...]] = {
+    score: tuple(names) for score, names in _score_groups.items()
+}
+"""各分值的因子池，供按分数构成抽取具体因子。"""
+
+_SCORE_POOL: tuple[tuple[int, int], ...] = tuple(
+    (score, len(_BY_SCORE[score])) for score in sorted(_BY_SCORE, reverse=True)
+)
+"""(分值, 该分值因子数)，按分值降序；分数构成枚举的搜索空间。"""
 
 
 class AmonArmy(NamedTuple):
@@ -187,6 +206,28 @@ COOP_MAPS: tuple[str, ...] = (
 )
 """合作任务地图（共 15 张）。"""
 
+COMMANDERS: tuple[str, ...] = (
+    "雷诺",
+    "凯瑞甘",
+    "阿塔尼斯",
+    "斯旺",
+    "阿拉纳克",
+    "沃拉尊",
+    "阿巴瑟",
+    "德哈卡",
+    "菲尼克斯",
+    "诺娃",
+    "斯托科夫",
+    "凯拉克斯",
+    "扎加拉",
+    "米拉·汉",
+    "泰凯斯",
+    "泽拉图",
+    "斯台特曼",
+    "蒙斯克",
+)
+"""合作任务指挥官（共 18 位；「汉和霍纳」按米拉·汉与霍纳分列）。"""
+
 AMON_ARMIES: tuple[AmonArmy, ...] = (
     # 星灵
     AmonArmy("星灵", "大师机械"),
@@ -216,7 +257,7 @@ AMON_ARMIES: tuple[AmonArmy, ...] = (
 
 @dataclass(frozen=True)
 class BrutalCombo:
-    """一次随机残酷+的开局配置：难度、地图、埃蒙部队与因子组合。"""
+    """一次随机残酷+的开局配置：难度、地图、埃蒙部队、因子组合与指挥官。"""
 
     level: int
     """难度档位（1～6）。"""
@@ -229,6 +270,9 @@ class BrutalCombo:
 
     factors: tuple[str, ...]
     """因子名称，按分数从高到低排列。"""
+
+    commanders: tuple[str, ...] = ()
+    """随机到的指挥官（两位）；空元组表示未开启指挥官随机。"""
 
     @property
     def rule(self) -> BrutalRule:
@@ -247,64 +291,81 @@ class BrutalCombo:
 
 
 @cache
-def _combo_groups(level: int) -> tuple[tuple[tuple[str, ...], ...], ...]:
-    """枚举该难度下全部合法因子组合，按因子个数分组。
+def _score_profiles(level: int) -> tuple[tuple[int, ...], ...]:
+    """枚举该难度下全部合法分数构成。
 
-    因子池按分数升序，DFS 剪枝：当前分数加上剩余最小可能和超过
-    区间上限时提前终止；加上剩余最大可能和仍达不到下限时跳过。
+    一个分数构成是分值降序的多元组（如 (10, 7, 3)），满足：
+    长度在本档因子个数区间内、总和落在本档点数区间内、
+    每个分值的出现次数不超过该分值的因子数（保证可实例化）。
+
+    DFS 按分值降序逐档决定用量；当前和加上剩余位置全取
+    本档分值（后续档只会更小）仍达不到下限时提前终止。
     """
     rule = BRUTAL_RULES[level]
-    points = [FACTOR_POINTS[name] for name in _POOL]
-    size = len(points)
-    found: list[tuple[str, ...]] = []
-    partial: list[str] = []
+    profiles: list[tuple[int, ...]] = []
+    partial: list[int] = []
+    size = len(_SCORE_POOL)
 
-    def search(remain: int, start: int, lo: int, hi: int) -> None:
-        if remain == 0:
-            if lo <= 0 <= hi:
-                found.append(tuple(partial))
+    def search(idx: int, count: int, total: int) -> None:
+        # 终态（档位决策完毕或因子位已满）判定一次，避免同一构成
+        # 沿跳档分支在每个后续档位入口被重复记录
+        if idx >= size or count >= rule.max_count:
+            if (
+                rule.min_count <= count <= rule.max_count
+                and rule.min_total <= total <= rule.max_total
+            ):
+                profiles.append(tuple(partial))
             return
-        for i in range(start, size - remain + 1):
-            point = points[i]
-            # 升序池：分数只增不减，最小可能和一旦超过上限即可终止
-            if point + sum(points[i + 1 : i + remain]) > hi:
+        score, avail = _SCORE_POOL[idx]
+        # 剩余位置全取本档分值（后续档只会更小）也够不到下限，剪枝
+        if total + score * (rule.max_count - count) < rule.min_total:
+            return
+        for use in range(1, avail + 1):
+            if count + use > rule.max_count or total + score * use > rule.max_total:
                 break
-            # 剩余最大可能和（池尾 remain-1 个）仍不足下限，当前分数太低
-            if point + sum(points[size - remain + 1 :]) < lo:
-                continue
-            partial.append(_POOL[i])
-            search(remain - 1, i + 1, lo - point, hi - point)
-            partial.pop()
+            partial.extend((score,) * use)
+            search(idx + 1, count + use, total + score * use)
+            del partial[-use:]
+        search(idx + 1, count, total)  # 跳过本档
 
-    groups = []
-    for count in range(rule.min_count, rule.max_count + 1):
-        found.clear()
-        search(count, 0, rule.min_total, rule.max_total)
-        groups.append(tuple(found))
-    return tuple(groups)
+    search(0, 0, 0)
+    return tuple(profiles)
 
 
-def random_brutal(level: int, rng: random.Random | None = None) -> BrutalCombo:
+def random_brutal(
+    level: int,
+    rng: random.Random | None = None,
+    *,
+    with_commanders: bool = False,
+) -> BrutalCombo:
     """按难度规律随机生成一局残酷+开局。
 
-    因子个数先在允许范围内均匀取值，再在该个数的全部合法组合中
-    均匀抽取，避免个数多的组合数量占优时几乎抽不出个数少的组合
-    （如残酷+6 的双 10 分因子）；地图与埃蒙部队在各自池中均匀抽取。
+    先在本档全部合法分数构成中均匀抽取一种（每种分数体验
+    等概率，避免组合数量多的形态——尤其是含 10 分因子者——
+    占据过高频率），再在该构成下从各分值池均匀抽取具体因子；
+    地图与埃蒙部队在各自池中均匀抽取。with_commanders 为
+    True 时再从指挥官池均匀抽取两位不重复的指挥官。
     """
     if level not in BRUTAL_RULES:
         raise ValueError(f"未知的残酷+难度：{level}")
     if rng is None:
         rng = random
-    groups = [group for group in _combo_groups(level) if group]
-    if not groups:
+    profiles = _score_profiles(level)
+    if not profiles:
         raise ValueError(f"残酷+{level}无合法组合")
-    factors = rng.choice(rng.choice(groups))
+    profile = rng.choice(profiles)
+    needs: Counter[int] = Counter(profile)
+    factors: list[str] = []
+    for score, need in needs.items():
+        factors.extend(rng.sample(_BY_SCORE[score], need))
     ordered = tuple(sorted(factors, key=lambda name: -FACTOR_POINTS[name]))
+    commanders = tuple(rng.sample(COMMANDERS, 2)) if with_commanders else ()
     return BrutalCombo(
         level=level,
         map_name=rng.choice(COOP_MAPS),
         army=rng.choice(AMON_ARMIES),
         factors=ordered,
+        commanders=commanders,
     )
 
 
@@ -326,3 +387,36 @@ def parse_brutal_level(text: str) -> int | None:
         return None
     level = int(key)
     return level if level in BRUTAL_RULES else None
+
+
+COMMANDER_KEYWORDS = ("随机指挥官", "指挥官")
+"""「随机残酷」附带指挥官随机的关键词，长词在前以免被短词截断。"""
+
+
+class BrutalArgs(NamedTuple):
+    """「随机残酷」的参数解析结果。"""
+
+    level: int | None
+    """难度档位（1～6）；None 表示未指定，调用方随机抽取。"""
+
+    with_commanders: bool
+    """是否额外随机两位指挥官。"""
+
+
+def parse_brutal_args(text: str) -> BrutalArgs | None:
+    """把「随机残酷」的参数解析为难度档位与指挥官开关。
+
+    支持「3」「3指挥官」「指挥官」「随机残酷 3 指挥官」等写法；
+    空文本即随机难度。除去指挥官关键词后剩余文本无法识别时返回 None。
+    """
+    key = normalize_query(text)
+    with_commanders = False
+    for keyword in COMMANDER_KEYWORDS:
+        if keyword in key:
+            key = key.replace(keyword, "")
+            with_commanders = True
+    key = key.strip()
+    if not key:
+        return BrutalArgs(None, with_commanders)
+    level = parse_brutal_level(key)
+    return None if level is None else BrutalArgs(level, with_commanders)
