@@ -4,8 +4,8 @@
 每期突变自其「日期」（周一）起开放 7 天，按周轮换；
 全部 184 期构成一轮完整循环，超出数据覆盖范围时按整轮折算。
 
-除基础轮换信息外，每期还携带推荐指挥官（含威望）、注意事项、
-保底位（第 4 位，固定阿塔尼斯）与推荐原因，用于详情展示。
+除基础轮换信息外，每期还携带最强指挥官（第 4 位，
+固定阿塔尼斯）与推荐原因，用于详情展示。
 """
 
 import unicodedata
@@ -101,17 +101,11 @@ class Mutation:
     number: str | None = None
     """原图右侧数字，缺失或为「/」时为 None。"""
 
-    commanders: tuple[CommanderPick, ...] = ()
-    """推荐指挥官（1～3 位，按推荐顺序：首选、互补、备选）。"""
-
-    notes: str = ""
-    """注意事项：地图打法要点与因子应对建议。"""
-
     bonus: CommanderPick | None = None
-    """第 4 位保底/情怀位（固定阿塔尼斯，守护之壳容错）。"""
+    """最强指挥官（第 4 位，固定阿塔尼斯，守护之壳容错）。"""
 
     reason: str = ""
-    """保底位的推荐原因（恶搞口吻的点评）。"""
+    """最强指挥官的推荐原因（恶搞口吻的点评）。"""
 
     @property
     def end_date(self) -> date:
@@ -172,11 +166,6 @@ def _parse_row(row: tuple[object, ...]) -> Mutation | None:
     )
     raw_number = "" if row[10] is None else str(row[10]).strip()
     number = raw_number if raw_number and raw_number not in {"/", "／", "-"} else None
-    commanders = tuple(
-        pick
-        for name_col, prestige_col in ((11, 12), (13, 14), (15, 16))
-        if (pick := _parse_pick(row, name_col, prestige_col)) is not None
-    )
     return Mutation(
         mid=mid,
         name=str(row[1]).strip(),
@@ -184,8 +173,6 @@ def _parse_row(row: tuple[object, ...]) -> Mutation | None:
         start_date=_parse_date(row[3]),
         factors=factors,
         number=number,
-        commanders=commanders,
-        notes=_parse_text(row[17]),
         bonus=_parse_pick(row, 18, 19),
         reason=_parse_text(row[20]),
     )

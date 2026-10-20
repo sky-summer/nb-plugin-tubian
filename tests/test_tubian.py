@@ -131,21 +131,15 @@ class TestMutationBook(unittest.TestCase):
         self.assertIsNone(self.book.get(128).number)  # 原表为「/」
 
     def test_recommendation_fields(self) -> None:
-        """推荐指挥官（含威望）、注意事项、保底位与推荐原因均被解析。"""
+        """最强指挥官与推荐原因均被解析，注意事项与推荐列表已移除。"""
         mutation = self.book.get(128)
         assert mutation is not None
-        self.assertEqual(
-            [p.name for p in mutation.commanders], ["斯台特曼", "泽拉图", "凯拉克斯"]
-        )
-        self.assertEqual(
-            [p.prestige for p in mutation.commanders],
-            ["P2 最佳伙伴", "P2 知识探求者", "P1 战争建筑师"],
-        )
-        self.assertTrue(mutation.notes.startswith("①长图守三路"))
         assert mutation.bonus is not None
         self.assertEqual(mutation.bonus.name, "阿塔尼斯")
         self.assertIn("我大主教还需要用哪个威望", mutation.bonus.prestige)
         self.assertTrue(mutation.reason.startswith("往日神庙守三路"))
+        self.assertFalse(hasattr(mutation, "commanders"))
+        self.assertFalse(hasattr(mutation, "notes"))
 
     def test_commander_pick_display(self) -> None:
         """带威望时展示为「名称（威望）」，无威望时仅名称。"""
@@ -154,11 +148,9 @@ class TestMutationBook(unittest.TestCase):
         self.assertEqual(CommanderPick("雷诺").display, "雷诺")
 
     def test_all_mutations_have_recommendations(self) -> None:
-        """每期都有 3 位推荐指挥官、保底位、注意事项与推荐原因。"""
+        """每期都有最强指挥官与推荐原因。"""
         for m in self.book._by_id.values():
-            self.assertEqual(len(m.commanders), 3, f"#{m.mid} 推荐指挥官不足 3 位")
-            self.assertIsNotNone(m.bonus, f"#{m.mid} 缺少保底位")
-            self.assertTrue(m.notes, f"#{m.mid} 缺少注意事项")
+            self.assertIsNotNone(m.bonus, f"#{m.mid} 缺少最强指挥官")
             self.assertTrue(m.reason, f"#{m.mid} 缺少推荐原因")
 
     def test_icon_path(self) -> None:
@@ -182,14 +174,13 @@ class TestMutationBook(unittest.TestCase):
             )
 
     def test_all_recommended_commanders_have_icons(self) -> None:
-        """数据表中的推荐指挥官（含保底位）都能取到头像。"""
-        names = {p.name for m in self.book._by_id.values() for p in m.commanders}
+        """数据表中最强指挥官（大主教）能取到头像。"""
         for m in self.book._by_id.values():
-            if m.bonus is not None:
-                names.add(m.bonus.name)
-        for name in names:
+            if m.bonus is None:
+                continue
             self.assertIsNotNone(
-                self.book.commander_icon_path(name), f"缺少指挥官头像：{name}"
+                self.book.commander_icon_path(m.bonus.name),
+                f"#{m.mid} 缺少最强指挥官头像：{m.bonus.name}",
             )
 
     def test_commander_icon_aliases(self) -> None:
@@ -277,9 +268,8 @@ class TestMessageCard(unittest.TestCase):
         card = self._card("OneBot V11", mutation, "本周突变")
         images = [seg for seg in card if seg.type == "image"]
         bonus = () if mutation.bonus is None else (mutation.bonus,)
-        picks = (*mutation.commanders, *bonus)
-        # 地图 + 推荐指挥官（含保底位）+ 因子
-        self.assertEqual(len(images), 1 + len(picks) + len(mutation.factors))
+        # 地图 + 保底位（大主教）+ 因子
+        self.assertEqual(len(images), 1 + len(bonus) + len(mutation.factors))
         for seg in images:
             file = str(seg.data["file"])
             self.assertTrue(file.startswith("base64://"), file[:32])
@@ -368,32 +358,31 @@ class TestMessageCard(unittest.TestCase):
         self.assertIn("同名突变共 6 期", card.extract_plain_text())
 
     def test_card_recommendation_text(self) -> None:
-        """详情卡片包含推荐指挥官（含威望）、注意事项、保底位与推荐原因。"""
+        """详情卡片的最强指挥官与推荐原因合并为一行，注意事项已移除。"""
         mutation = self.book.at(date(2026, 10, 15))
         text = self._card("OneBot V11", mutation, "本周突变").extract_plain_text()
-        self.assertIn("推荐指挥官：", text)
-        self.assertIn("斯台特曼（P2 最佳伙伴）", text)
-        self.assertIn("泽拉图（P2 知识探求者）", text)
-        self.assertIn("凯拉克斯（P1 战争建筑师）", text)
-        self.assertIn("保底位：阿塔尼斯", text)
-        self.assertIn("注意事项：", text)
-        self.assertIn(mutation.notes, text)
-        self.assertIn(f"推荐原因：{mutation.reason}", text)
+        assert mutation.bonus is not None
+        self.assertIn("推荐指挥官：\n最强指挥官：", text)
+        self.assertIn(f"最强指挥官：{mutation.bonus.display}——{mutation.reason}", text)
+        self.assertNotIn("注意事项：", text)
+        self.assertNotIn("推荐原因：", text)
+        self.assertNotIn("P2 最佳伙伴", text)
 
     def test_card_recommendation_qq(self) -> None:
-        """QQ 侧详情文字齐全，推荐指挥官头像拼入唯一媒体图。"""
+        """QQ 侧详情文字齐全，最强指挥官头像拼入唯一媒体图。"""
         mutation = self.book.at(date(2026, 10, 15))
         card = self._card("QQ", mutation, "本周突变")
         text = card.extract_plain_text()
-        self.assertIn("推荐指挥官：", text)
-        self.assertIn("斯台特曼（P2 最佳伙伴）", text)
-        self.assertIn("保底位：阿塔尼斯", text)
-        self.assertIn("注意事项：", text)
+        assert mutation.bonus is not None
+        self.assertIn(f"最强指挥官：{mutation.bonus.display}——", text)
+        self.assertNotIn("注意事项：", text)
         images = [seg for seg in card if seg.type == "file_image"]
         self.assertEqual(len(images), 1)
         data = bytes(images[0].data["content"])
         self.assertTrue(data.startswith(b"\x89PNG"))
-        self.assertEqual(str(images[0].data["file_name"]), f"突变{mutation.mid}_详情.png")
+        self.assertEqual(
+            str(images[0].data["file_name"]), f"突变{mutation.mid}_详情.png"
+        )
 
     def test_card_fallback_text_only(self) -> None:
         mutation = self.book.at(date(2026, 10, 15))

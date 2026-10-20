@@ -7,11 +7,11 @@
 以及「订阅突变」定时推送：每周一 08:00 向订阅会话发送本周突变，
 主动消息无权限时随会话的下一条消息补发（被动回复，无需该权限）。
 
-突变详情卡片按数据表附带推荐指挥官（含威望与头像）、
-注意事项、保底位（大主教）与推荐原因。
+突变详情卡片按数据表附带最强指挥官（大主教）及其推荐原因，
+二者合并为一行展示。
 
 QQ 官方接口每条消息只接受一个媒体文件，本版将地图图片、
-推荐指挥官头像与全部因子图标拼接为一张长图，
+最强指挥官头像与全部因子图标拼接为一张长图，
 作为单条消息的唯一媒体浮在文字卡上方。
 """
 
@@ -35,6 +35,7 @@ from nonebot.rule import TRIE_VALUE, TrieRule
 from .brutal import MAX_LEVEL, BrutalCombo, parse_brutal_args, random_brutal
 from .config import Config, config
 from .data import (
+    CommanderPick,
     Mutation,
     MutationBook,
     MutationDataError,
@@ -61,7 +62,7 @@ __plugin_meta__ = PluginMetadata(
     name="星际争霸每周突变",
     description="根据突变列表 Excel 与当前时间，自动选中本周突变并返回",
     usage=(
-        "突变 / 本周突变 / tb — 查询本周突变（含因子、地图、推荐指挥官与注意事项）\n"
+        "突变 / 本周突变 / tb — 查询本周突变（含因子、地图与最强指挥官推荐）\n"
         "下周突变 / tbx — 查询下周突变\n"
         "突变 <序号> — 按轮换序号查询，如：突变 128\n"
         "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
@@ -77,7 +78,7 @@ __plugin_meta__ = PluginMetadata(
 
 HELP_TEXT = (
     "星际争霸每周突变查询 全部功能：\n"
-    "突变 / 本周突变 / tb — 查询本周突变（含因子、地图、推荐指挥官与注意事项）\n"
+    "突变 / 本周突变 / tb — 查询本周突变（含因子、地图与最强指挥官推荐）\n"
     "下周突变 / tbx — 查询下周突变\n"
     "突变 <序号> — 按轮换序号查询，如：突变 128\n"
     "突变查询 <名称> — 按突变名称搜索，如：突变查询 恐惧神庙\n"
@@ -322,10 +323,7 @@ class _CardParts(NamedTuple):
     """指挥官名称，用于取头像；空元组表示不配指挥官。"""
 
     commander_lines: tuple[str, ...] = ()
-    """指挥官展示行（如附带威望）；非空时逐行展示，与 commanders 对应取头像。"""
-
-    extra_lines: tuple[str, ...] = ()
-    """因子行之后、结尾文字之前的附加行（注意事项、保底位、推荐原因等）。"""
+    """指挥官展示行（自带标签与推荐理由）；非空时逐行展示，与 commanders 对应取头像。"""
 
 
 def _qq_card(bot: Bot, parts: _CardParts) -> Message:
@@ -340,7 +338,6 @@ def _qq_card(bot: Bot, parts: _CardParts) -> Message:
     if parts.factor_lines:
         text += "因子：\n"
         text += "".join(f"{line}\n" for line in parts.factor_lines)
-    text += "".join(f"{line}\n" for line in parts.extra_lines)
     message = msg_cls()
     image = _merged_card_image(parts.map_name, parts.factors, parts.commanders)
     if image is not None:
@@ -392,8 +389,6 @@ def _inline_card(bot: Bot, parts: _CardParts) -> Message:
             if segment is not None:
                 message += segment
             message += msg_cls(f"{line}\n")
-    for line in parts.extra_lines:
-        message += msg_cls(f"{line}\n")
     if parts.footer:
         message += msg_cls(parts.footer)
     return message
@@ -413,19 +408,16 @@ def _factor_card(bot: Bot, parts: _CardParts) -> Message:
 def _build_card(
     bot: Bot, mutation: Mutation, label: str, note: str | None = None
 ) -> Message:
-    """构造突变信息卡片消息：因子与推荐指挥官图标、注意事项与推荐攻略。"""
+    """构造突变信息卡片消息：因子图标与最强指挥官（大主教）推荐。"""
     header, footer = _card_text(mutation, label, note)
-    picks = mutation.commanders
-    commander_lines = [pick.display for pick in picks]
+    picks: tuple[CommanderPick, ...] = ()
+    commander_lines: list[str] = []
     if mutation.bonus is not None:
-        picks = (*picks, mutation.bonus)
-        commander_lines.append(f"保底位：{mutation.bonus.display}")
-    extra_lines = []
-    if mutation.notes:
-        extra_lines.append("注意事项：")
-        extra_lines.append(mutation.notes)
-    if mutation.reason:
-        extra_lines.append(f"推荐原因：{mutation.reason}")
+        picks = (mutation.bonus,)
+        line = f"最强指挥官：{mutation.bonus.display}"
+        if mutation.reason:
+            line = f"{line}——{mutation.reason}"
+        commander_lines.append(line)
     parts = _CardParts(
         header=header,
         footer=footer,
@@ -435,7 +427,6 @@ def _build_card(
         map_name=mutation.map_name,
         commanders=tuple(pick.name for pick in picks),
         commander_lines=tuple(commander_lines),
-        extra_lines=tuple(extra_lines),
     )
     return _factor_card(bot, parts)
 
